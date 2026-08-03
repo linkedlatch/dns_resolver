@@ -4,6 +4,7 @@
 package cache
 
 import (
+	"bytes"
 	"container/list"
 	"strings"
 	"sync"
@@ -18,6 +19,16 @@ const (
 	// negativeCacheFallbackTTL is used for NXDOMAIN responses that (unusually)
 	// carried no SOA record to derive a proper negative TTL from (RFC 2308).
 	negativeCacheFallbackTTL = 60
+
+	// Bounds on how long an entry may live, whatever TTL the answer
+	// carried. The upper bound matters most: the TTL is chosen entirely by
+	// the server that sent the record, and nothing stops a broken or
+	// hostile one from sending 2^32-1, which is about 136 years. The lower
+	// bound keeps a server that stamps everything with a one-second TTL
+	// from making the cache pointless. unbound spells these cache-max-ttl
+	// and cache-min-ttl.
+	maxCacheTTL = 86400 // one day
+	minCacheTTL = 5
 )
 
 type key struct {
@@ -38,7 +49,8 @@ type store struct {
 	mu         sync.Mutex
 	maxEntries int
 	entries    map[key]*entry
-	order      *list.List // front = most recently used
+	order      *list.List       // front = most recently used
+	now        func() time.Time // replaced in tests, so expiry needs no sleeping
 }
 
 func newStore(maxEntries int) *store {
@@ -49,6 +61,7 @@ func newStore(maxEntries int) *store {
 		maxEntries: maxEntries,
 		entries:    make(map[key]*entry),
 		order:      list.New(),
+		now:        time.Now,
 	}
 }
 
@@ -65,7 +78,7 @@ func (s *store) lookup(name string, qtype dnsmsg.RRType) (rcode dnsmsg.RCode, an
 	if !found {
 		return 0, nil, nil, false
 	}
-	remaining := time.Until(e.expiry)
+	remaining := e.expiry.Sub(s.now())
 	if remaining <= 0 {
 		s.order.Remove(e.elem)
 		delete(s.entries, k)
@@ -95,8 +108,9 @@ func (s *store) put(name string, qtype dnsmsg.RRType, rcode dnsmsg.RCode, answer
 		return
 	}
 	if ttl == 0 {
-		return
+		return // TTL 0 means "use this once, do not cache it" (RFC 2308)
 	}
+	ttl = clampTTL(ttl)
 
 	k := normalizeKey(name, qtype)
 
@@ -109,10 +123,12 @@ func (s *store) put(name string, qtype dnsmsg.RRType, rcode dnsmsg.RCode, answer
 	}
 
 	e := &entry{
-		rcode:       rcode,
-		answers:     answers,
-		authorities: authorities,
-		expiry:      time.Now().Add(time.Duration(ttl) * time.Second),
+		rcode: rcode,
+		// Copied on the way in as well as on the way out: the caller still
+		// holds these records and is free to modify them.
+		answers:     cloneRRs(answers),
+		authorities: cloneRRs(authorities),
+		expiry:      s.now().Add(time.Duration(ttl) * time.Second),
 	}
 	e.elem = s.order.PushFront(k)
 	s.entries[k] = e
@@ -131,14 +147,41 @@ func normalizeKey(name string, qtype dnsmsg.RRType) key {
 	return key{name: strings.ToLower(strings.TrimSuffix(name, ".")), qtype: qtype}
 }
 
+func clampTTL(ttl uint32) uint32 {
+	return min(max(ttl, minCacheTTL), maxCacheTTL)
+}
+
 func withTTL(rrs []dnsmsg.RR, ttl uint32) []dnsmsg.RR {
+	out := cloneRRs(rrs)
+	for i := range out {
+		out[i].TTL = ttl
+	}
+	return out
+}
+
+// cloneRRs copies rrs deeply enough that the result shares nothing mutable
+// with the original.
+//
+// Copying the structs alone is not enough: the address, RDATA and SOA
+// fields are a slice, a slice and a pointer, so plain assignment leaves two
+// records pointing at the same bytes. A cached entry is handed to every
+// client that asks for the name, and the moment any middleware rewrites a
+// record it received - a filter, a rewriter, DNS64 - it would be editing
+// what everyone else gets served.
+func cloneRRs(rrs []dnsmsg.RR) []dnsmsg.RR {
 	if len(rrs) == 0 {
 		return nil
 	}
 	out := make([]dnsmsg.RR, len(rrs))
 	for i, rr := range rrs {
 		out[i] = rr
-		out[i].TTL = ttl
+		out[i].A = bytes.Clone(rr.A)
+		out[i].AAAA = bytes.Clone(rr.AAAA)
+		out[i].Raw = bytes.Clone(rr.Raw)
+		if rr.SOA != nil {
+			soa := *rr.SOA
+			out[i].SOA = &soa
+		}
 	}
 	return out
 }
@@ -220,5 +263,35 @@ type recordingWriter struct {
 
 func (w *recordingWriter) WriteMsg(msg *dnsmsg.Message) error {
 	w.msg = msg
-	return w.ResponseWriter.WriteMsg(msg)
+
+	// Cap what the client is told as well, not just what we keep. This
+	// response is passing straight through on a cache miss, and a stub
+	// resolver holding an absurd TTL in its own cache is the same problem
+	// one step downstream - where we can no longer expire it.
+	out := *msg
+	out.Answers = capTTLs(msg.Answers)
+	out.Authorities = capTTLs(msg.Authorities)
+	return w.ResponseWriter.WriteMsg(&out)
+}
+
+// capTTLs returns rrs with no TTL above the cache's ceiling, sharing the
+// input when it is already within it. Only the ceiling is applied: raising
+// a short TTL is a decision about our own storage, not something to tell a
+// client about.
+func capTTLs(rrs []dnsmsg.RR) []dnsmsg.RR {
+	capped := false
+	for _, rr := range rrs {
+		if rr.TTL > maxCacheTTL {
+			capped = true
+			break
+		}
+	}
+	if !capped {
+		return rrs
+	}
+	out := cloneRRs(rrs)
+	for i := range out {
+		out[i].TTL = min(out[i].TTL, maxCacheTTL)
+	}
+	return out
 }

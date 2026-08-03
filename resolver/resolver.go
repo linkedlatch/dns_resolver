@@ -74,8 +74,9 @@ func soaAuthority(authorities []dnsmsg.RR) []dnsmsg.RR {
 // authoritative server rather than the real internet; the zero value
 // queries the real root servers on the standard port.
 type Resolver struct {
-	roots []net.IP // nil: the built-in root hints
-	port  string   // "": defaultUpstreamPort
+	roots        []net.IP // nil: the built-in root hints
+	port         string   // "": defaultUpstreamPort
+	allowPrivate bool     // permit querying loopback and private addresses
 }
 
 // New returns a Resolver that starts every resolution at the root servers.
@@ -141,6 +142,10 @@ func (r *Resolver) ResolveRR(qname string, qtype dnsmsg.RRType) (Result, error) 
 
 func (r *Resolver) resolve(qname string, qtype dnsmsg.RRType, cnameDepth, glueDepth int) (Result, error) {
 	servers := r.rootServers()
+	// zone is what the servers we are currently talking to are authoritative
+	// for. It bounds what their answers are allowed to affect: a referral
+	// has to lead strictly below it, and glue has to be a name inside it.
+	zone := "."
 
 	for referrals := 0; ; referrals++ {
 		if referrals >= maxReferrals {
@@ -174,7 +179,7 @@ func (r *Resolver) resolve(qname string, qtype dnsmsg.RRType, cnameDepth, glueDe
 		for {
 			var cname *dnsmsg.RR
 			for i, rr := range resp.Answers {
-				if !equalName(rr.Name, name) {
+				if !equalName(rr.Name, name) || rr.Class != dnsmsg.ClassIN {
 					continue
 				}
 				switch {
@@ -216,16 +221,33 @@ func (r *Resolver) resolve(qname string, qtype dnsmsg.RRType, cnameDepth, glueDe
 		}
 
 		// No direct answer: look for a referral to more authoritative
-		// servers. Only trust NS delegations that are in-bailiwick for
-		// qname (i.e. for qname itself or one of its ancestor zones), so
-		// a malicious or compromised authoritative server can't redirect
-		// resolution for an unrelated zone by stuffing extra NS records
-		// into the authority section.
+		// servers. A delegation is only trusted if it is
+		//
+		//   - in-bailiwick for qname (for qname itself or one of its
+		//     ancestor zones), so a server cannot redirect resolution of an
+		//     unrelated zone by stuffing extra NS records into its answer,
+		//   - and strictly below the zone this server is authoritative for,
+		//     because that is the only direction a delegation can go. That
+		//     invariant is what actually terminates the walk: without it a
+		//     server can keep pointing at the same zone (or back at the
+		//     root) and only maxReferrals stops it, 30 round trips later.
+		var newZone string
 		nsNames := make(map[string]bool)
 		for _, rr := range resp.Authorities {
-			if rr.Type == dnsmsg.TypeNS && isSubdomainOrEqual(qname, rr.Name) {
-				nsNames[strings.ToLower(rr.NS)] = true
+			if rr.Type != dnsmsg.TypeNS || rr.Class != dnsmsg.ClassIN {
+				continue
 			}
+			if !isSubdomainOrEqual(qname, rr.Name) || !isProperSubdomain(rr.Name, zone) {
+				continue
+			}
+			// One referral delegates one zone; NS records for anything else
+			// alongside it are not part of it.
+			if newZone == "" {
+				newZone = rr.Name
+			} else if !equalName(rr.Name, newZone) {
+				continue
+			}
+			nsNames[strings.ToLower(rr.NS)] = true
 		}
 		if len(nsNames) == 0 {
 			// NODATA (RFC 2308 2.2): NOERROR with neither an answer nor a
@@ -237,15 +259,29 @@ func (r *Resolver) resolve(qname string, qtype dnsmsg.RRType, cnameDepth, glueDe
 			return Result{Authority: soaAuthority(resp.Authorities)}, nil
 		}
 
+		// Glue is a hint, not an answer: the addresses ride along in the
+		// additional section purely to save a round trip, and nothing in the
+		// protocol vouches for them. Only take glue for a name inside the
+		// zone this server is authoritative for - that is the only part of
+		// the tree it speaks for.
+		//
+		// Note this is the responding server's zone, not the zone being
+		// delegated. Requiring glue to sit under the delegated zone instead
+		// would deadlock the resolver: the root's glue for com is
+		// l.gtld-servers.net, which is not under com, and resolving that
+		// name needs com in the first place.
 		var newServers []net.IP
 		for _, rr := range resp.Additionals {
-			if !nsNames[strings.ToLower(rr.Name)] {
+			if !nsNames[strings.ToLower(rr.Name)] || rr.Class != dnsmsg.ClassIN {
+				continue
+			}
+			if !isSubdomainOrEqual(rr.Name, zone) {
 				continue
 			}
 			switch {
-			case rr.Type == dnsmsg.TypeA && rr.A != nil:
+			case rr.Type == dnsmsg.TypeA && rr.A != nil && r.allowsUpstream(rr.A):
 				newServers = append(newServers, rr.A)
-			case rr.Type == dnsmsg.TypeAAAA && rr.AAAA != nil:
+			case rr.Type == dnsmsg.TypeAAAA && rr.AAAA != nil && r.allowsUpstream(rr.AAAA):
 				newServers = append(newServers, rr.AAAA)
 			}
 		}
@@ -260,7 +296,7 @@ func (r *Resolver) resolve(qname string, qtype dnsmsg.RRType, cnameDepth, glueDe
 					continue
 				}
 				for _, rr := range res.Answers {
-					if rr.Type == dnsmsg.TypeA && rr.A != nil {
+					if rr.Type == dnsmsg.TypeA && rr.A != nil && r.allowsUpstream(rr.A) {
 						newServers = append(newServers, rr.A)
 					}
 				}
@@ -274,13 +310,45 @@ func (r *Resolver) resolve(qname string, qtype dnsmsg.RRType, cnameDepth, glueDe
 		}
 
 		servers = newServers
+		zone = newZone
 	}
+}
+
+// allowsUpstream reports whether a name server address is one we are
+// willing to send a query to.
+//
+// Nothing stops an authoritative server from handing back a private or
+// loopback address as the place to ask next, which would turn the resolver
+// into a probe of the network it runs on: response timing alone tells an
+// attacker which internal addresses have something listening. Only DNS
+// queries can be sent this way, but that is enough to map a network.
+func (r *Resolver) allowsUpstream(ip net.IP) bool {
+	if r.allowPrivate {
+		return true
+	}
+	if v4 := ip.To4(); v4 != nil {
+		ip = v4 // treat IPv4-mapped IPv6 as the IPv4 address it stands for
+	}
+	switch {
+	case ip.IsUnspecified(), ip.IsLoopback(), ip.IsPrivate(),
+		ip.IsLinkLocalUnicast(), ip.IsLinkLocalMulticast(), ip.IsMulticast():
+		return false
+	case len(ip) == net.IPv4len && ip[0] == 100 && ip[1]&0xC0 == 64:
+		return false // 100.64.0.0/10, carrier-grade NAT (RFC 6598)
+	}
+	return true
 }
 
 // queryServers tries each server in turn until one answers.
 func (r *Resolver) queryServers(servers []net.IP, qname string, qtype dnsmsg.RRType) (*dnsmsg.Message, net.IP, error) {
 	var lastErr error
 	for _, s := range servers {
+		// Checked again here, not only where addresses are taken from a
+		// response, so that no path reaches a dial without passing it.
+		if !r.allowsUpstream(s) {
+			lastErr = fmt.Errorf("refusing to query name server at %s", s)
+			continue
+		}
 		msg, err := r.query(s, qname, qtype)
 		if err != nil {
 			lastErr = err
@@ -438,12 +506,24 @@ func unpackAndVerify(buf []byte, wantID uint16, qname string, qtype dnsmsg.RRTyp
 	if len(msg.Questions) != 1 || !equalName(msg.Questions[0].Name, qname) || msg.Questions[0].Type != qtype {
 		return nil, fmt.Errorf("response question section does not match query for %s %s", qname, qtype)
 	}
+	// We only ever ask in class IN, so an answer in any other class is not
+	// a reply to what we sent, whatever its name and type say.
+	if msg.Questions[0].Class != dnsmsg.ClassIN {
+		return nil, fmt.Errorf("response question for %s is in class %d, want IN", qname, msg.Questions[0].Class)
+	}
 	return msg, nil
 }
 
 // equalName compares domain names ignoring case and a trailing root dot.
 func equalName(a, b string) bool {
 	return strings.EqualFold(strings.TrimSuffix(a, "."), strings.TrimSuffix(b, "."))
+}
+
+// isProperSubdomain reports whether name is strictly below zone. It is the
+// invariant a referral has to satisfy: delegation only ever moves down the
+// tree, so a server answering for zone may only send us to a zone under it.
+func isProperSubdomain(name, zone string) bool {
+	return !equalName(name, zone) && isSubdomainOrEqual(name, zone)
 }
 
 // isSubdomainOrEqual reports whether name is zone itself or a subdomain of
