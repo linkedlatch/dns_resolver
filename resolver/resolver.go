@@ -21,6 +21,8 @@ const (
 	maxGlueLookups = 6 // caps recursive lookups for NS addresses missing glue
 	queryTimeout   = 3 * time.Second
 	udpReadBufSize = 4096
+
+	defaultUpstreamPort = "53"
 )
 
 // ErrNXDOMAIN indicates the queried name does not exist. Callers that need
@@ -67,10 +69,31 @@ func soaAuthority(authorities []dnsmsg.RR) []dnsmsg.RR {
 // Resolver performs iterative DNS resolution starting from the root
 // servers. It holds no state, so a single Resolver is safe for concurrent
 // use by multiple goroutines.
-type Resolver struct{}
+//
+// Both fields exist so tests can aim resolution at a local fake
+// authoritative server rather than the real internet; the zero value
+// queries the real root servers on the standard port.
+type Resolver struct {
+	roots []net.IP // nil: the built-in root hints
+	port  string   // "": defaultUpstreamPort
+}
 
 // New returns a Resolver that starts every resolution at the root servers.
 func New() *Resolver { return &Resolver{} }
+
+func (r *Resolver) rootServers() []net.IP {
+	if r.roots == nil {
+		return RootServers
+	}
+	return r.roots
+}
+
+func (r *Resolver) upstreamPort() string {
+	if r.port == "" {
+		return defaultUpstreamPort
+	}
+	return r.port
+}
 
 // Result is what a successful resolution produced.
 //
@@ -117,7 +140,7 @@ func (r *Resolver) ResolveRR(qname string, qtype dnsmsg.RRType) (Result, error) 
 }
 
 func (r *Resolver) resolve(qname string, qtype dnsmsg.RRType, cnameDepth, glueDepth int) (Result, error) {
-	servers := RootServers
+	servers := r.rootServers()
 
 	for referrals := 0; ; referrals++ {
 		if referrals >= maxReferrals {
@@ -303,12 +326,13 @@ func (r *Resolver) queryOnce(server net.IP, qname string, qtype dnsmsg.RRType, e
 		return nil, err
 	}
 
-	msg, err := queryUDP(server, packet, id, qname, qtype)
+	addr := net.JoinHostPort(server.String(), r.upstreamPort())
+	msg, err := queryUDP(addr, packet, id, qname, qtype)
 	if err != nil {
 		return nil, err
 	}
 	if msg.Header.TC {
-		msg, err = queryTCP(server, packet, id, qname, qtype)
+		msg, err = queryTCP(addr, packet, id, qname, qtype)
 		if err != nil {
 			return nil, err
 		}
@@ -338,8 +362,8 @@ func randomQueryID() (uint16, error) {
 	return binary.BigEndian.Uint16(b[:]), nil
 }
 
-func queryUDP(server net.IP, packet []byte, id uint16, qname string, qtype dnsmsg.RRType) (*dnsmsg.Message, error) {
-	conn, err := net.DialTimeout("udp", net.JoinHostPort(server.String(), "53"), queryTimeout)
+func queryUDP(addr string, packet []byte, id uint16, qname string, qtype dnsmsg.RRType) (*dnsmsg.Message, error) {
+	conn, err := net.DialTimeout("udp", addr, queryTimeout)
 	if err != nil {
 		return nil, err
 	}
@@ -357,8 +381,8 @@ func queryUDP(server net.IP, packet []byte, id uint16, qname string, qtype dnsms
 	return unpackAndVerify(buf[:n], id, qname, qtype)
 }
 
-func queryTCP(server net.IP, packet []byte, id uint16, qname string, qtype dnsmsg.RRType) (*dnsmsg.Message, error) {
-	conn, err := net.DialTimeout("tcp", net.JoinHostPort(server.String(), "53"), queryTimeout)
+func queryTCP(addr string, packet []byte, id uint16, qname string, qtype dnsmsg.RRType) (*dnsmsg.Message, error) {
+	conn, err := net.DialTimeout("tcp", addr, queryTimeout)
 	if err != nil {
 		return nil, err
 	}
