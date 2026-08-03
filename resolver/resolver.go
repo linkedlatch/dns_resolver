@@ -28,6 +28,30 @@ const (
 // it to RCODE 3) should check with errors.Is, not by matching error text.
 var ErrNXDOMAIN = errors.New("NXDOMAIN")
 
+// NXDOMAINError is returned when a name doesn't exist. It carries the SOA
+// record from the authority section (when the authoritative server sent
+// one), which callers doing negative caching need for the correct TTL
+// (RFC 2308: min(SOA.TTL, SOA.Minimum)).
+type NXDOMAINError struct {
+	Name string
+	SOA  *dnsmsg.RR // nil if the response had no SOA in its authority section
+}
+
+func (e *NXDOMAINError) Error() string { return fmt.Sprintf("NXDOMAIN: %s", e.Name) }
+
+// Is lets errors.Is(err, ErrNXDOMAIN) work for callers that only care
+// whether the name exists, without needing the SOA.
+func (e *NXDOMAINError) Is(target error) bool { return target == ErrNXDOMAIN }
+
+func newNXDOMAINError(qname string, authorities []dnsmsg.RR) *NXDOMAINError {
+	for i := range authorities {
+		if authorities[i].Type == dnsmsg.TypeSOA && authorities[i].SOA != nil {
+			return &NXDOMAINError{Name: qname, SOA: &authorities[i]}
+		}
+	}
+	return &NXDOMAINError{Name: qname}
+}
+
 type Resolver struct{}
 
 func New() *Resolver { return &Resolver{} }
@@ -74,7 +98,7 @@ func (r *Resolver) resolve(qname string, qtype dnsmsg.RRType, cnameDepth, glueDe
 		}
 
 		if resp.Header.RCode == dnsmsg.RCodeNameError {
-			return nil, fmt.Errorf("%w: %s", ErrNXDOMAIN, qname)
+			return nil, newNXDOMAINError(qname, resp.Authorities)
 		}
 		if resp.Header.RCode != dnsmsg.RCodeSuccess {
 			return nil, fmt.Errorf("%s answered %s query for %s with RCODE %d", server, qtype, qname, resp.Header.RCode)

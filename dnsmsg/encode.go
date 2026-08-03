@@ -107,6 +107,21 @@ func (e *encoder) writeRR(rr RR) error {
 		if err := e.writeName(rr.CNAME); err != nil {
 			return err
 		}
+	case TypeSOA:
+		if rr.SOA == nil {
+			return fmt.Errorf("SOA record for %q has no SOA data", rr.Name)
+		}
+		if err := e.writeName(rr.SOA.MName); err != nil {
+			return err
+		}
+		if err := e.writeName(rr.SOA.RName); err != nil {
+			return err
+		}
+		e.writeUint32(rr.SOA.Serial)
+		e.writeUint32(rr.SOA.Refresh)
+		e.writeUint32(rr.SOA.Retry)
+		e.writeUint32(rr.SOA.Expire)
+		e.writeUint32(rr.SOA.Minimum)
 	default:
 		e.buf = append(e.buf, rr.Raw...)
 	}

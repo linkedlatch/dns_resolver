@@ -189,6 +189,46 @@ func (d *decoder) readQuestion() (Question, error) {
 	return q, nil
 }
 
+func (d *decoder) readSOA() (*SOA, error) {
+	mname, err := d.readName()
+	if err != nil {
+		return nil, err
+	}
+	rname, err := d.readName()
+	if err != nil {
+		return nil, err
+	}
+	serial, err := d.readUint32()
+	if err != nil {
+		return nil, err
+	}
+	refresh, err := d.readUint32()
+	if err != nil {
+		return nil, err
+	}
+	retry, err := d.readUint32()
+	if err != nil {
+		return nil, err
+	}
+	expire, err := d.readUint32()
+	if err != nil {
+		return nil, err
+	}
+	minimum, err := d.readUint32()
+	if err != nil {
+		return nil, err
+	}
+	return &SOA{
+		MName:   mname,
+		RName:   rname,
+		Serial:  serial,
+		Refresh: refresh,
+		Retry:   retry,
+		Expire:  expire,
+		Minimum: minimum,
+	}, nil
+}
+
 func (d *decoder) readRRs(count int) ([]RR, error) {
 	prealloc := count
 	if prealloc > maxRRPrealloc {
@@ -266,6 +306,12 @@ func (d *decoder) readRR() (RR, error) {
 			return rr, err
 		}
 		rr.CNAME = n
+	case TypeSOA:
+		soa, err := d.readSOA()
+		if err != nil {
+			return rr, err
+		}
+		rr.SOA = soa
 	default:
 		b, err := d.readBytes(int(rdlen))
 		if err != nil {

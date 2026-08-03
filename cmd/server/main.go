@@ -7,6 +7,7 @@ import (
 
 	"dns_resolver/dnsmsg"
 	"dns_resolver/dnsserver"
+	"dns_resolver/middleware/cache"
 	"dns_resolver/resolver"
 )
 
@@ -14,9 +15,10 @@ func main() {
 	addr := flag.String("addr", "127.0.0.1:5353", "address to listen on for DNS queries (UDP and TCP)")
 	flag.Parse()
 
+	base := &resolverHandler{r: resolver.New()}
 	srv := &dnsserver.Server{
 		Addr:    *addr,
-		Handler: &resolverHandler{r: resolver.New()},
+		Handler: cache.Wrap(base, 0),
 	}
 	log.Printf("listening on %s (udp+tcp)", *addr)
 	log.Fatal(srv.ListenAndServe())
@@ -48,11 +50,19 @@ func (h *resolverHandler) ServeDNS(w dnsserver.ResponseWriter, req *dnsmsg.Messa
 	q := req.Questions[0]
 
 	answers, err := h.r.ResolveRR(q.Name, q.Type)
+	var nxErr *resolver.NXDOMAINError
 	switch {
 	case err == nil:
 		resp.Answers = answers
-	case errors.Is(err, resolver.ErrNXDOMAIN):
+	case errors.As(err, &nxErr):
 		resp.Header.RCode = dnsmsg.RCodeNameError
+		if nxErr.SOA != nil {
+			// Carrying the SOA through lets a downstream cache derive the
+			// correct negative-caching TTL (RFC 2308) from the response
+			// itself, and matches what a real authoritative/recursive
+			// server sends a client on NXDOMAIN.
+			resp.Authorities = []dnsmsg.RR{*nxErr.SOA}
+		}
 	default:
 		log.Printf("resolve %s %s: %v", q.Name, q.Type, err)
 		resp.Header.RCode = dnsmsg.RCodeServerFailure

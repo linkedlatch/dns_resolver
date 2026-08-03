@@ -71,6 +71,18 @@ type Question struct {
 	Class Class
 }
 
+// SOA holds the parsed RDATA of an SOA record: zone metadata including the
+// negative-caching TTL (Minimum, per RFC 2308).
+type SOA struct {
+	MName   string // primary master name server for the zone
+	RName   string // zone administrator's mailbox, encoded as a domain name
+	Serial  uint32
+	Refresh uint32
+	Retry   uint32
+	Expire  uint32
+	Minimum uint32
+}
+
 // RR is a resource record. Only the fields relevant to the record's Type
 // are populated; the rest are zero values.
 type RR struct {
@@ -84,6 +96,7 @@ type RR struct {
 	AAAA  net.IP // TypeAAAA
 	NS    string // TypeNS
 	CNAME string // TypeCNAME
+	SOA   *SOA   // TypeSOA
 	Raw   []byte // any other type: raw RDATA
 }
 
