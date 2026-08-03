@@ -1,78 +1,70 @@
 package main
 
 import (
-	"errors"
+	"context"
 	"flag"
 	"log"
+	"net/netip"
+	"os/signal"
+	"strings"
+	"syscall"
 
-	"dns_resolver/dnsmsg"
 	"dns_resolver/dnsserver"
+	"dns_resolver/middleware/acl"
 	"dns_resolver/middleware/cache"
+	"dns_resolver/middleware/ratelimit"
 	"dns_resolver/resolver"
+	"dns_resolver/resolverhandler"
 )
 
 func main() {
 	addr := flag.String("addr", "127.0.0.1:5353", "address to listen on for DNS queries (UDP and TCP)")
+	allow := flag.String("allow", "", "comma-separated CIDRs allowed to query this server (default: loopback only)")
+	rate := flag.Float64("rate", 0, "queries per second allowed per client address (0: built-in default)")
+	maxInFlight := flag.Int("max-in-flight", 0, "queries that may be resolved at once (0: built-in default)")
 	flag.Parse()
 
-	base := &resolverHandler{r: resolver.New()}
+	allowed, err := parsePrefixes(*allow)
+	if err != nil {
+		log.Fatalf("-allow: %v", err)
+	}
+
+	// Innermost first: resolution, then cache, then the checks that should
+	// run before any work is done on a query.
+	handler := resolverhandler.New(resolver.New())
+	handler = cache.Wrap(handler, 0)
+	handler = ratelimit.Wrap(handler, *rate, 0)
+	handler = acl.Wrap(handler, allowed)
+
 	srv := &dnsserver.Server{
-		Addr:    *addr,
-		Handler: cache.Wrap(base, 0),
+		Addr:        *addr,
+		Handler:     handler,
+		MaxInFlight: *maxInFlight,
 	}
-	log.Printf("listening on %s (udp+tcp)", *addr)
-	log.Fatal(srv.ListenAndServe())
+
+	// A signal cancels the context, which stops the listeners and lets the
+	// queries already in progress finish before the process exits.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	log.Printf("listening on %s (udp+tcp), answering %s", *addr, allowed)
+	if err := srv.ListenAndServe(ctx); err != nil {
+		log.Fatal(err)
+	}
+	log.Print("shut down")
 }
 
-// resolverHandler bridges dnsserver.Handler to resolver.Resolver: it's the
-// innermost handler in what will become a middleware chain (cache, rate
-// limiting, etc. wrapping this) as the server grows more features.
-type resolverHandler struct {
-	r *resolver.Resolver
-}
-
-func (h *resolverHandler) ServeDNS(w dnsserver.ResponseWriter, req *dnsmsg.Message) {
-	resp := &dnsmsg.Message{
-		Header: dnsmsg.Header{
-			ID: req.Header.ID,
-			QR: true,
-			RD: req.Header.RD,
-			RA: true,
-		},
-		Questions: req.Questions,
+func parsePrefixes(s string) ([]netip.Prefix, error) {
+	if strings.TrimSpace(s) == "" {
+		return acl.LoopbackOnly(), nil
 	}
-
-	if len(req.Questions) != 1 {
-		resp.Header.RCode = dnsmsg.RCodeFormatError
-		w.WriteMsg(resp)
-		return
-	}
-	q := req.Questions[0]
-
-	res, err := h.r.ResolveRR(q.Name, q.Type)
-	var nxErr *resolver.NXDOMAINError
-	switch {
-	case err == nil:
-		// A NODATA result (name exists, no record of this type) arrives here
-		// too, as an empty answer section plus the zone's SOA: NOERROR with
-		// no answers is the correct reply for it, not an error.
-		resp.Answers = res.Answers
-		resp.Authorities = res.Authority
-	case errors.As(err, &nxErr):
-		resp.Header.RCode = dnsmsg.RCodeNameError
-		if nxErr.SOA != nil {
-			// Carrying the SOA through lets a downstream cache derive the
-			// correct negative-caching TTL (RFC 2308) from the response
-			// itself, and matches what a real authoritative/recursive
-			// server sends a client on NXDOMAIN.
-			resp.Authorities = []dnsmsg.RR{*nxErr.SOA}
+	var out []netip.Prefix
+	for _, field := range strings.Split(s, ",") {
+		p, err := netip.ParsePrefix(strings.TrimSpace(field))
+		if err != nil {
+			return nil, err
 		}
-	default:
-		log.Printf("resolve %s %s: %v", q.Name, q.Type, err)
-		resp.Header.RCode = dnsmsg.RCodeServerFailure
+		out = append(out, p)
 	}
-
-	if err := w.WriteMsg(resp); err != nil {
-		log.Printf("write response for %s %s: %v", q.Name, q.Type, err)
-	}
+	return out, nil
 }

@@ -1,13 +1,18 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"dns_resolver/dnsmsg"
 	"dns_resolver/resolver"
 )
+
+// resolveTimeout bounds the whole lookup, however many servers it takes.
+const resolveTimeout = 10 * time.Second
 
 func main() {
 	if len(os.Args) < 2 || len(os.Args) > 3 {
@@ -29,7 +34,10 @@ func main() {
 		}
 	}
 
-	ips, err := resolver.New().Resolve(name, qtype)
+	ctx, cancel := context.WithTimeout(context.Background(), resolveTimeout)
+	defer cancel()
+
+	ips, err := resolver.New().Resolve(ctx, name, qtype)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "resolve %s %s: %v\n", name, qtype, err)
 		os.Exit(1)

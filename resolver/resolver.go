@@ -4,6 +4,7 @@
 package resolver
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/binary"
 	"errors"
@@ -112,8 +113,8 @@ type Result struct {
 // Resolve performs iterative resolution of qname/qtype starting from the
 // root servers and returns the resulting A/AAAA addresses, following any
 // CNAME chain along the way.
-func (r *Resolver) Resolve(qname string, qtype dnsmsg.RRType) ([]net.IP, error) {
-	res, err := r.ResolveRR(qname, qtype)
+func (r *Resolver) Resolve(ctx context.Context, qname string, qtype dnsmsg.RRType) ([]net.IP, error) {
+	res, err := r.ResolveRR(ctx, qname, qtype)
 	if err != nil {
 		return nil, err
 	}
@@ -136,11 +137,11 @@ func (r *Resolver) Resolve(qname string, qtype dnsmsg.RRType) ([]net.IP, error) 
 // addresses. A DNS server answering client queries needs the TTL to report
 // accurate values (and, later, to drive cache expiry), and needs the CNAME
 // chain and NODATA SOA that Result carries to build a correct response.
-func (r *Resolver) ResolveRR(qname string, qtype dnsmsg.RRType) (Result, error) {
-	return r.resolve(qname, qtype, 0, 0)
+func (r *Resolver) ResolveRR(ctx context.Context, qname string, qtype dnsmsg.RRType) (Result, error) {
+	return r.resolve(ctx, qname, qtype, 0, 0)
 }
 
-func (r *Resolver) resolve(qname string, qtype dnsmsg.RRType, cnameDepth, glueDepth int) (Result, error) {
+func (r *Resolver) resolve(ctx context.Context, qname string, qtype dnsmsg.RRType, cnameDepth, glueDepth int) (Result, error) {
 	servers := r.rootServers()
 	// zone is what the servers we are currently talking to are authoritative
 	// for. It bounds what their answers are allowed to affect: a referral
@@ -148,11 +149,14 @@ func (r *Resolver) resolve(qname string, qtype dnsmsg.RRType, cnameDepth, glueDe
 	zone := "."
 
 	for referrals := 0; ; referrals++ {
+		if err := ctx.Err(); err != nil {
+			return Result{}, fmt.Errorf("resolving %s: %w", qname, err)
+		}
 		if referrals >= maxReferrals {
 			return Result{}, fmt.Errorf("too many referrals resolving %s", qname)
 		}
 
-		resp, server, err := r.queryServers(servers, qname, qtype)
+		resp, server, err := r.queryServers(ctx, servers, qname, qtype)
 		if err != nil {
 			return Result{}, err
 		}
@@ -212,7 +216,7 @@ func (r *Resolver) resolve(qname string, qtype dnsmsg.RRType, cnameDepth, glueDe
 			// The chain left what this server knows about; resolve the
 			// rest from the root, keeping the CNAMEs collected so far in
 			// front of whatever it finds.
-			res, err := r.resolve(name, qtype, cnameDepth+len(chain), glueDepth)
+			res, err := r.resolve(ctx, name, qtype, cnameDepth+len(chain), glueDepth)
 			if err != nil {
 				return Result{}, err
 			}
@@ -291,7 +295,7 @@ func (r *Resolver) resolve(qname string, qtype dnsmsg.RRType, cnameDepth, glueDe
 				return Result{}, fmt.Errorf("referral for %s has no glue and glue lookup depth exceeded", qname)
 			}
 			for ns := range nsNames {
-				res, err := r.resolve(ns, dnsmsg.TypeA, 0, glueDepth+1)
+				res, err := r.resolve(ctx, ns, dnsmsg.TypeA, 0, glueDepth+1)
 				if err != nil {
 					continue
 				}
@@ -340,7 +344,7 @@ func (r *Resolver) allowsUpstream(ip net.IP) bool {
 }
 
 // queryServers tries each server in turn until one answers.
-func (r *Resolver) queryServers(servers []net.IP, qname string, qtype dnsmsg.RRType) (*dnsmsg.Message, net.IP, error) {
+func (r *Resolver) queryServers(ctx context.Context, servers []net.IP, qname string, qtype dnsmsg.RRType) (*dnsmsg.Message, net.IP, error) {
 	var lastErr error
 	for _, s := range servers {
 		// Checked again here, not only where addresses are taken from a
@@ -349,7 +353,7 @@ func (r *Resolver) queryServers(servers []net.IP, qname string, qtype dnsmsg.RRT
 			lastErr = fmt.Errorf("refusing to query name server at %s", s)
 			continue
 		}
-		msg, err := r.query(s, qname, qtype)
+		msg, err := r.query(ctx, s, qname, qtype)
 		if err != nil {
 			lastErr = err
 			continue
@@ -362,10 +366,10 @@ func (r *Resolver) queryServers(servers []net.IP, qname string, qtype dnsmsg.RRT
 // query asks one server, preferring EDNS0 so that larger responses arrive
 // in a single UDP datagram instead of forcing a TCP retry. Servers too old
 // or too strict to accept an OPT record are retried the plain RFC 1035 way.
-func (r *Resolver) query(server net.IP, qname string, qtype dnsmsg.RRType) (*dnsmsg.Message, error) {
-	msg, err := r.queryOnce(server, qname, qtype, withEDNS0)
+func (r *Resolver) query(ctx context.Context, server net.IP, qname string, qtype dnsmsg.RRType) (*dnsmsg.Message, error) {
+	msg, err := r.queryOnce(ctx, server, qname, qtype, withEDNS0)
 	if err == nil && ednsRefused(msg) {
-		return r.queryOnce(server, qname, qtype, withoutEDNS0)
+		return r.queryOnce(ctx, server, qname, qtype, withoutEDNS0)
 	}
 	return msg, err
 }
@@ -379,7 +383,7 @@ const (
 	withoutEDNS0 ednsMode = false
 )
 
-func (r *Resolver) queryOnce(server net.IP, qname string, qtype dnsmsg.RRType, edns ednsMode) (*dnsmsg.Message, error) {
+func (r *Resolver) queryOnce(ctx context.Context, server net.IP, qname string, qtype dnsmsg.RRType, edns ednsMode) (*dnsmsg.Message, error) {
 	id, err := randomQueryID()
 	if err != nil {
 		return nil, fmt.Errorf("generate query ID: %w", err)
@@ -395,12 +399,12 @@ func (r *Resolver) queryOnce(server net.IP, qname string, qtype dnsmsg.RRType, e
 	}
 
 	addr := net.JoinHostPort(server.String(), r.upstreamPort())
-	msg, err := queryUDP(addr, packet, id, qname, qtype)
+	msg, err := queryUDP(ctx, addr, packet, id, qname, qtype)
 	if err != nil {
 		return nil, err
 	}
 	if msg.Header.TC {
-		msg, err = queryTCP(addr, packet, id, qname, qtype)
+		msg, err = queryTCP(ctx, addr, packet, id, qname, qtype)
 		if err != nil {
 			return nil, err
 		}
@@ -430,13 +434,32 @@ func randomQueryID() (uint16, error) {
 	return binary.BigEndian.Uint16(b[:]), nil
 }
 
-func queryUDP(addr string, packet []byte, id uint16, qname string, qtype dnsmsg.RRType) (*dnsmsg.Message, error) {
-	conn, err := net.DialTimeout("udp", addr, queryTimeout)
+// dial connects to one name server. queryTimeout bounds this socket; ctx
+// bounds the resolution it belongs to, and cancels the dial with it.
+func dial(ctx context.Context, network, addr string) (net.Conn, error) {
+	d := net.Dialer{Timeout: queryTimeout}
+	return d.DialContext(ctx, network, addr)
+}
+
+// socketDeadline is the earlier of what this socket is allowed and what is
+// left of the whole query's budget. Without the second half, a resolution
+// that keeps finding servers to talk to has no end: every individual socket
+// stays inside its timeout while the client waits indefinitely.
+func socketDeadline(ctx context.Context) time.Time {
+	deadline := time.Now().Add(queryTimeout)
+	if budget, ok := ctx.Deadline(); ok && budget.Before(deadline) {
+		return budget
+	}
+	return deadline
+}
+
+func queryUDP(ctx context.Context, addr string, packet []byte, id uint16, qname string, qtype dnsmsg.RRType) (*dnsmsg.Message, error) {
+	conn, err := dial(ctx, "udp", addr)
 	if err != nil {
 		return nil, err
 	}
 	defer conn.Close()
-	conn.SetDeadline(time.Now().Add(queryTimeout))
+	conn.SetDeadline(socketDeadline(ctx))
 
 	if _, err := conn.Write(packet); err != nil {
 		return nil, err
@@ -449,13 +472,13 @@ func queryUDP(addr string, packet []byte, id uint16, qname string, qtype dnsmsg.
 	return unpackAndVerify(buf[:n], id, qname, qtype)
 }
 
-func queryTCP(addr string, packet []byte, id uint16, qname string, qtype dnsmsg.RRType) (*dnsmsg.Message, error) {
-	conn, err := net.DialTimeout("tcp", addr, queryTimeout)
+func queryTCP(ctx context.Context, addr string, packet []byte, id uint16, qname string, qtype dnsmsg.RRType) (*dnsmsg.Message, error) {
+	conn, err := dial(ctx, "tcp", addr)
 	if err != nil {
 		return nil, err
 	}
 	defer conn.Close()
-	conn.SetDeadline(time.Now().Add(queryTimeout))
+	conn.SetDeadline(socketDeadline(ctx))
 
 	lenPrefix := make([]byte, 2)
 	binary.BigEndian.PutUint16(lenPrefix, uint16(len(packet)))

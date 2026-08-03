@@ -6,6 +6,7 @@ package cache
 import (
 	"bytes"
 	"container/list"
+	"context"
 	"strings"
 	"sync"
 	"time"
@@ -223,9 +224,9 @@ func Wrap(next dnsserver.Handler, maxEntries int) dnsserver.Handler {
 	return &handler{next: next, store: newStore(maxEntries)}
 }
 
-func (h *handler) ServeDNS(w dnsserver.ResponseWriter, req *dnsmsg.Message) {
+func (h *handler) ServeDNS(ctx context.Context, w dnsserver.ResponseWriter, req *dnsmsg.Message) {
 	if len(req.Questions) != 1 {
-		h.next.ServeDNS(w, req)
+		h.next.ServeDNS(ctx, w, req)
 		return
 	}
 	q := req.Questions[0]
@@ -247,7 +248,7 @@ func (h *handler) ServeDNS(w dnsserver.ResponseWriter, req *dnsmsg.Message) {
 	}
 
 	rec := &recordingWriter{ResponseWriter: w}
-	h.next.ServeDNS(rec, req)
+	h.next.ServeDNS(ctx, rec, req)
 	if rec.msg != nil {
 		h.store.put(q.Name, q.Type, rec.msg.Header.RCode, rec.msg.Answers, rec.msg.Authorities)
 	}
