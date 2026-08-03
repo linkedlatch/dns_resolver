@@ -15,6 +15,8 @@ const (
 	TypeNS    RRType = 2
 	TypeCNAME RRType = 5
 	TypeSOA   RRType = 6
+	TypePTR   RRType = 12
+	TypeMX    RRType = 15
 	TypeAAAA  RRType = 28
 	TypeOPT   RRType = 41 // EDNS0 pseudo-record; see edns.go
 )
@@ -29,6 +31,10 @@ func (t RRType) String() string {
 		return "CNAME"
 	case TypeSOA:
 		return "SOA"
+	case TypePTR:
+		return "PTR"
+	case TypeMX:
+		return "MX"
 	case TypeAAAA:
 		return "AAAA"
 	case TypeOPT:

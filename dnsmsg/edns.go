@@ -22,8 +22,19 @@ const ednsDOBit uint32 = 0x8000
 // they do not support the EDNS version we asked for.
 const RCodeBadVers uint16 = 16
 
+// RequestDNSSEC and NoDNSSEC name the do argument of NewOPT and
+// PackQueryEDNS0 at call sites, where a bare true/false gives no hint of
+// which flag is being set.
+const (
+	RequestDNSSEC = true
+	NoDNSSEC      = false
+)
+
 // NewOPT builds an OPT pseudo-record advertising udpSize as the largest
 // UDP response we can accept, optionally requesting DNSSEC records.
+//
+// do is wired through for DNSSEC validation, which is not implemented yet;
+// every caller currently passes NoDNSSEC.
 func NewOPT(udpSize uint16, do bool) RR {
 	rr := RR{
 		Name:  ".",

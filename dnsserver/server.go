@@ -124,7 +124,7 @@ func withOPT(additionals []dnsmsg.RR, udpSize int) []dnsmsg.RR {
 			out = append(out, rr)
 		}
 	}
-	return append(out, dnsmsg.NewOPT(uint16(udpSize), false))
+	return append(out, dnsmsg.NewOPT(uint16(udpSize), dnsmsg.NoDNSSEC))
 }
 
 func (s *Server) serveTCP(ln net.Listener) error {

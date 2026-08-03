@@ -312,6 +312,36 @@ func (d *decoder) readRR() (RR, error) {
 			return rr, err
 		}
 		rr.SOA = soa
+	case TypePTR, TypeMX:
+		// PTR and MX RDATA carry a domain name that may be compressed, i.e.
+		// a pointer to an offset elsewhere in *this* message. Keeping those
+		// bytes verbatim in Raw would corrupt the record as soon as we
+		// re-encode it into a message of our own, where that offset means
+		// something else. So expand the name here and store uncompressed
+		// RDATA, which stays valid wherever it is written.
+		//
+		// Only types defined by RFC 1035 may compress names in RDATA
+		// (RFC 3597 4), so TXT/SRV/CAA and every other type we pass through
+		// as Raw are safe to copy byte for byte. The remaining RFC 1035
+		// name-bearing types (MB/MD/MF/MG/MR/MINFO) are long obsolete and
+		// not handled.
+		var prefix []byte
+		if rr.Type == TypeMX {
+			pref, err := d.readUint16()
+			if err != nil {
+				return rr, err
+			}
+			prefix = binary.BigEndian.AppendUint16(nil, pref)
+		}
+		n, err := d.readName()
+		if err != nil {
+			return rr, err
+		}
+		encoded, err := encodeName(n)
+		if err != nil {
+			return rr, err
+		}
+		rr.Raw = append(prefix, encoded...)
 	default:
 		b, err := d.readBytes(int(rdlen))
 		if err != nil {

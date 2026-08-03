@@ -49,11 +49,15 @@ func (h *resolverHandler) ServeDNS(w dnsserver.ResponseWriter, req *dnsmsg.Messa
 	}
 	q := req.Questions[0]
 
-	answers, err := h.r.ResolveRR(q.Name, q.Type)
+	res, err := h.r.ResolveRR(q.Name, q.Type)
 	var nxErr *resolver.NXDOMAINError
 	switch {
 	case err == nil:
-		resp.Answers = answers
+		// A NODATA result (name exists, no record of this type) arrives here
+		// too, as an empty answer section plus the zone's SOA: NOERROR with
+		// no answers is the correct reply for it, not an error.
+		resp.Answers = res.Answers
+		resp.Authorities = res.Authority
 	case errors.As(err, &nxErr):
 		resp.Header.RCode = dnsmsg.RCodeNameError
 		if nxErr.SOA != nil {
