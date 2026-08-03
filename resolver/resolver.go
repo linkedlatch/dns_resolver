@@ -4,9 +4,9 @@
 package resolver
 
 import (
+	"crypto/rand"
 	"encoding/binary"
 	"fmt"
-	"math/rand"
 	"net"
 	"strings"
 	"time"
@@ -53,39 +53,57 @@ func (r *Resolver) resolve(qname string, qtype dnsmsg.RRType, cnameDepth, glueDe
 			return nil, fmt.Errorf("%s answered %s query for %s with RCODE %d", server, qtype, qname, resp.Header.RCode)
 		}
 
+		// Follow any CNAME chain as far as this single response allows
+		// before falling back to a fresh iterative lookup for the
+		// remainder: servers commonly bundle the whole chain plus the
+		// final answer together in one response.
+		name := qname
 		var ips []net.IP
-		var cname string
-		for _, rr := range resp.Answers {
-			if !strings.EqualFold(rr.Name, qname) {
-				continue
+		hops := 0
+		for {
+			var cnameTarget string
+			for _, rr := range resp.Answers {
+				if !equalName(rr.Name, name) {
+					continue
+				}
+				switch {
+				case rr.Type == qtype && qtype == dnsmsg.TypeA && rr.A != nil:
+					ips = append(ips, rr.A)
+				case rr.Type == qtype && qtype == dnsmsg.TypeAAAA && rr.AAAA != nil:
+					ips = append(ips, rr.AAAA)
+				case rr.Type == dnsmsg.TypeCNAME:
+					cnameTarget = rr.CNAME
+				}
 			}
-			switch {
-			case rr.Type == qtype && qtype == dnsmsg.TypeA && rr.A != nil:
-				ips = append(ips, rr.A)
-			case rr.Type == qtype && qtype == dnsmsg.TypeAAAA && rr.AAAA != nil:
-				ips = append(ips, rr.AAAA)
-			case rr.Type == dnsmsg.TypeCNAME:
-				cname = rr.CNAME
+			if len(ips) > 0 || cnameTarget == "" {
+				break
 			}
+			hops++
+			if cnameDepth+hops >= maxCNAMEChain {
+				return nil, fmt.Errorf("CNAME chain too long starting at %s", qname)
+			}
+			name = cnameTarget
 		}
 
 		if len(ips) > 0 {
 			return ips, nil
 		}
-		if cname != "" {
-			if cnameDepth >= maxCNAMEChain {
-				return nil, fmt.Errorf("CNAME chain too long starting at %s", qname)
-			}
-			return r.resolve(cname, qtype, cnameDepth+1, glueDepth)
+		if name != qname {
+			return r.resolve(name, qtype, cnameDepth+hops, glueDepth)
 		}
 		if len(resp.Answers) > 0 {
 			return nil, fmt.Errorf("no %s record for %s (other records present)", qtype, qname)
 		}
 
-		// No direct answer: look for a referral to more authoritative servers.
+		// No direct answer: look for a referral to more authoritative
+		// servers. Only trust NS delegations that are in-bailiwick for
+		// qname (i.e. for qname itself or one of its ancestor zones), so
+		// a malicious or compromised authoritative server can't redirect
+		// resolution for an unrelated zone by stuffing extra NS records
+		// into the authority section.
 		nsNames := make(map[string]bool)
 		for _, rr := range resp.Authorities {
-			if rr.Type == dnsmsg.TypeNS {
+			if rr.Type == dnsmsg.TypeNS && isSubdomainOrEqual(qname, rr.Name) {
 				nsNames[strings.ToLower(rr.NS)] = true
 			}
 		}
@@ -95,8 +113,14 @@ func (r *Resolver) resolve(qname string, qtype dnsmsg.RRType, cnameDepth, glueDe
 
 		var newServers []net.IP
 		for _, rr := range resp.Additionals {
-			if rr.Type == dnsmsg.TypeA && rr.A != nil && nsNames[strings.ToLower(rr.Name)] {
+			if !nsNames[strings.ToLower(rr.Name)] {
+				continue
+			}
+			switch {
+			case rr.Type == dnsmsg.TypeA && rr.A != nil:
 				newServers = append(newServers, rr.A)
+			case rr.Type == dnsmsg.TypeAAAA && rr.AAAA != nil:
+				newServers = append(newServers, rr.AAAA)
 			}
 		}
 
@@ -135,18 +159,21 @@ func (r *Resolver) queryServers(servers []net.IP, qname string, qtype dnsmsg.RRT
 }
 
 func (r *Resolver) query(server net.IP, qname string, qtype dnsmsg.RRType) (*dnsmsg.Message, error) {
-	id := uint16(rand.Intn(1 << 16))
+	id, err := randomQueryID()
+	if err != nil {
+		return nil, fmt.Errorf("generate query ID: %w", err)
+	}
 	packet, err := dnsmsg.PackQuery(id, qname, qtype)
 	if err != nil {
 		return nil, err
 	}
 
-	msg, err := queryUDP(server, packet, id)
+	msg, err := queryUDP(server, packet, id, qname, qtype)
 	if err != nil {
 		return nil, err
 	}
 	if msg.Header.TC {
-		msg, err = queryTCP(server, packet, id)
+		msg, err = queryTCP(server, packet, id, qname, qtype)
 		if err != nil {
 			return nil, err
 		}
@@ -154,7 +181,18 @@ func (r *Resolver) query(server net.IP, qname string, qtype dnsmsg.RRType) (*dns
 	return msg, nil
 }
 
-func queryUDP(server net.IP, packet []byte, id uint16) (*dnsmsg.Message, error) {
+// randomQueryID uses crypto/rand rather than math/rand: the query ID is a
+// core defense against cache-poisoning (an off-path attacker guessing it
+// lets them forge an accepted answer), so it must not be predictable.
+func randomQueryID() (uint16, error) {
+	var b [2]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return 0, err
+	}
+	return binary.BigEndian.Uint16(b[:]), nil
+}
+
+func queryUDP(server net.IP, packet []byte, id uint16, qname string, qtype dnsmsg.RRType) (*dnsmsg.Message, error) {
 	conn, err := net.DialTimeout("udp", net.JoinHostPort(server.String(), "53"), queryTimeout)
 	if err != nil {
 		return nil, err
@@ -170,10 +208,10 @@ func queryUDP(server net.IP, packet []byte, id uint16) (*dnsmsg.Message, error) 
 	if err != nil {
 		return nil, err
 	}
-	return unpackAndVerify(buf[:n], id)
+	return unpackAndVerify(buf[:n], id, qname, qtype)
 }
 
-func queryTCP(server net.IP, packet []byte, id uint16) (*dnsmsg.Message, error) {
+func queryTCP(server net.IP, packet []byte, id uint16, qname string, qtype dnsmsg.RRType) (*dnsmsg.Message, error) {
 	conn, err := net.DialTimeout("tcp", net.JoinHostPort(server.String(), "53"), queryTimeout)
 	if err != nil {
 		return nil, err
@@ -196,7 +234,7 @@ func queryTCP(server net.IP, packet []byte, id uint16) (*dnsmsg.Message, error) 
 	if _, err := readFull(conn, buf); err != nil {
 		return nil, err
 	}
-	return unpackAndVerify(buf, id)
+	return unpackAndVerify(buf, id, qname, qtype)
 }
 
 func readFull(conn net.Conn, buf []byte) (int, error) {
@@ -211,7 +249,12 @@ func readFull(conn net.Conn, buf []byte) (int, error) {
 	return total, nil
 }
 
-func unpackAndVerify(buf []byte, wantID uint16) (*dnsmsg.Message, error) {
+// unpackAndVerify parses buf and checks that it actually answers the query
+// we sent: matching ID alone isn't enough, since a 16-bit ID is guessable
+// by an off-path attacker racing the real server's reply. QR and the
+// echoed question are cheap additional checks against spoofed or
+// misdirected responses.
+func unpackAndVerify(buf []byte, wantID uint16, qname string, qtype dnsmsg.RRType) (*dnsmsg.Message, error) {
 	msg, err := dnsmsg.Unpack(buf)
 	if err != nil {
 		return nil, err
@@ -219,5 +262,32 @@ func unpackAndVerify(buf []byte, wantID uint16) (*dnsmsg.Message, error) {
 	if msg.Header.ID != wantID {
 		return nil, fmt.Errorf("response ID %d does not match query ID %d", msg.Header.ID, wantID)
 	}
+	if !msg.Header.QR {
+		return nil, fmt.Errorf("message has QR=0 (not a response)")
+	}
+	if len(msg.Questions) != 1 || !equalName(msg.Questions[0].Name, qname) || msg.Questions[0].Type != qtype {
+		return nil, fmt.Errorf("response question section does not match query for %s %s", qname, qtype)
+	}
 	return msg, nil
+}
+
+// equalName compares domain names ignoring case and a trailing root dot.
+func equalName(a, b string) bool {
+	return strings.EqualFold(strings.TrimSuffix(a, "."), strings.TrimSuffix(b, "."))
+}
+
+// isSubdomainOrEqual reports whether name is zone itself or a subdomain of
+// zone, matching on whole labels (not string suffix). Used to enforce
+// bailiwick: a server answering for one zone must not be trusted to
+// delegate an unrelated zone via extra records slipped into its response.
+func isSubdomainOrEqual(name, zone string) bool {
+	name = strings.ToLower(strings.TrimSuffix(name, "."))
+	zone = strings.ToLower(strings.TrimSuffix(zone, "."))
+	if zone == "" {
+		return true // the root zone is an ancestor of everything
+	}
+	if name == zone {
+		return true
+	}
+	return strings.HasSuffix(name, "."+zone)
 }

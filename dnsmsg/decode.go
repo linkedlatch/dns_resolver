@@ -8,6 +8,13 @@ import (
 
 const maxCompressionPointerJumps = 20
 
+// maxRRPrealloc bounds how large a slice we'll preallocate based on a
+// record count taken from an untrusted message header. Without this, a
+// 12-byte packet claiming ANCOUNT=65535 forces a large upfront allocation
+// before a single byte of it is validated. append() still grows the slice
+// correctly if a message legitimately has more records than this.
+const maxRRPrealloc = 64
+
 // decoder reads sequential fields out of a DNS message buffer, tracking an
 // offset. Name decoding may jump around the buffer to follow compression
 // pointers (RFC 1035 4.1.4), which is why the whole message must stay
@@ -61,6 +68,7 @@ func (d *decoder) readName() (string, error) {
 	pos := d.off
 	jumped := false
 	jumps := 0
+	nameLen := 0
 
 	for {
 		if pos >= len(d.buf) {
@@ -97,6 +105,10 @@ func (d *decoder) readName() (string, error) {
 		pos++
 		if pos+int(length) > len(d.buf) {
 			return "", fmt.Errorf("label overruns buffer at offset %d", pos)
+		}
+		nameLen += int(length) + 1
+		if nameLen > maxNameLength {
+			return "", fmt.Errorf("name exceeds maximum length of %d bytes", maxNameLength)
 		}
 		labels = append(labels, string(d.buf[pos:pos+int(length)]))
 		pos += int(length)
@@ -178,7 +190,11 @@ func (d *decoder) readQuestion() (Question, error) {
 }
 
 func (d *decoder) readRRs(count int) ([]RR, error) {
-	rrs := make([]RR, 0, count)
+	prealloc := count
+	if prealloc > maxRRPrealloc {
+		prealloc = maxRRPrealloc
+	}
+	rrs := make([]RR, 0, prealloc)
 	for i := 0; i < count; i++ {
 		rr, err := d.readRR()
 		if err != nil {
