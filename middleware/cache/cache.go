@@ -4,7 +4,6 @@
 package cache
 
 import (
-	"bytes"
 	"container/list"
 	"context"
 	"strings"
@@ -30,7 +29,17 @@ const (
 	// and cache-min-ttl.
 	maxCacheTTL = 86400 // one day
 	minCacheTTL = 5
+
+	// serverFailureTTL is how long a SERVFAIL is remembered. Short, because
+	// it usually means a transient fault, but not zero: without it every
+	// client retry walks the whole delegation chain again to reach the same
+	// broken server. unbound uses the same 5 seconds.
+	serverFailureTTL = 5
 )
+
+// anyType is the qtype of an entry that answers for every type of a name,
+// which is what NXDOMAIN is: the name does not exist at all.
+const anyType = dnsmsg.RRType(0)
 
 type key struct {
 	name  string
@@ -38,6 +47,7 @@ type key struct {
 }
 
 type entry struct {
+	key         key
 	rcode       dnsmsg.RCode
 	answers     []dnsmsg.RR
 	authorities []dnsmsg.RR
@@ -70,15 +80,23 @@ func newStore(maxEntries int) *store {
 // reduced by the time elapsed since it was stored. ok is false on a miss or
 // if the entry has fully expired (in which case it's evicted here).
 func (s *store) lookup(name string, qtype dnsmsg.RRType) (rcode dnsmsg.RCode, answers, authorities []dnsmsg.RR, ok bool) {
-	k := normalizeKey(name, qtype)
-
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	e, found := s.entries[k]
+	e, found := s.entries[normalizeKey(name, qtype)]
+	if !found {
+		// A name that does not exist has no descendants either (RFC 8020),
+		// so a cached NXDOMAIN for any ancestor answers this query too.
+		// Besides saving the walk, this is what makes the cache useful
+		// against floods of made-up subdomains of one victim domain, where
+		// every name is different but they all sit under the same
+		// non-existent parent.
+		e, found = s.enclosingNXDOMAIN(name)
+	}
 	if !found {
 		return 0, nil, nil, false
 	}
+	k := e.key
 	remaining := e.expiry.Sub(s.now())
 	if remaining <= 0 {
 		s.order.Remove(e.elem)
@@ -102,9 +120,21 @@ func (s *store) put(name string, qtype dnsmsg.RRType, rcode dnsmsg.RCode, answer
 	var ttl uint32
 	switch {
 	case rcode == dnsmsg.RCodeNameError:
+		// The name itself does not exist, for any type, so this is stored
+		// once rather than per qtype.
+		qtype = anyType
 		ttl = negativeTTLFromSOA(authorities, negativeCacheFallbackTTL)
 	case rcode == dnsmsg.RCodeSuccess && len(answers) > 0:
 		ttl = minTTL(answers)
+	case rcode == dnsmsg.RCodeSuccess:
+		// NODATA: the name exists but has no record of this type, which is
+		// the everyday answer to an AAAA query for an IPv4-only host. RFC
+		// 2308 makes it negatively cacheable from the SOA just like
+		// NXDOMAIN; not caching it meant repeating the whole walk each
+		// time a dual-stack client asked.
+		ttl = negativeTTLFromSOA(authorities, negativeCacheFallbackTTL)
+	case rcode == dnsmsg.RCodeServerFailure:
+		ttl = serverFailureTTL
 	default:
 		return
 	}
@@ -124,11 +154,12 @@ func (s *store) put(name string, qtype dnsmsg.RRType, rcode dnsmsg.RCode, answer
 	}
 
 	e := &entry{
+		key:   k,
 		rcode: rcode,
 		// Copied on the way in as well as on the way out: the caller still
 		// holds these records and is free to modify them.
-		answers:     cloneRRs(answers),
-		authorities: cloneRRs(authorities),
+		answers:     dnsmsg.CloneRRs(answers),
+		authorities: dnsmsg.CloneRRs(authorities),
 		expiry:      s.now().Add(time.Duration(ttl) * time.Second),
 	}
 	e.elem = s.order.PushFront(k)
@@ -144,6 +175,22 @@ func (s *store) put(name string, qtype dnsmsg.RRType, rcode dnsmsg.RCode, answer
 	}
 }
 
+// enclosingNXDOMAIN looks for a cached NXDOMAIN on an ancestor of name.
+// Must be called with the mutex held.
+func (s *store) enclosingNXDOMAIN(name string) (*entry, bool) {
+	rest := normalizeKey(name, anyType).name
+	for {
+		if e, found := s.entries[key{name: rest, qtype: anyType}]; found {
+			return e, true
+		}
+		i := strings.Index(rest, ".")
+		if i < 0 {
+			return nil, false
+		}
+		rest = rest[i+1:]
+	}
+}
+
 func normalizeKey(name string, qtype dnsmsg.RRType) key {
 	return key{name: strings.ToLower(strings.TrimSuffix(name, ".")), qtype: qtype}
 }
@@ -153,36 +200,9 @@ func clampTTL(ttl uint32) uint32 {
 }
 
 func withTTL(rrs []dnsmsg.RR, ttl uint32) []dnsmsg.RR {
-	out := cloneRRs(rrs)
+	out := dnsmsg.CloneRRs(rrs)
 	for i := range out {
 		out[i].TTL = ttl
-	}
-	return out
-}
-
-// cloneRRs copies rrs deeply enough that the result shares nothing mutable
-// with the original.
-//
-// Copying the structs alone is not enough: the address, RDATA and SOA
-// fields are a slice, a slice and a pointer, so plain assignment leaves two
-// records pointing at the same bytes. A cached entry is handed to every
-// client that asks for the name, and the moment any middleware rewrites a
-// record it received - a filter, a rewriter, DNS64 - it would be editing
-// what everyone else gets served.
-func cloneRRs(rrs []dnsmsg.RR) []dnsmsg.RR {
-	if len(rrs) == 0 {
-		return nil
-	}
-	out := make([]dnsmsg.RR, len(rrs))
-	for i, rr := range rrs {
-		out[i] = rr
-		out[i].A = bytes.Clone(rr.A)
-		out[i].AAAA = bytes.Clone(rr.AAAA)
-		out[i].Raw = bytes.Clone(rr.Raw)
-		if rr.SOA != nil {
-			soa := *rr.SOA
-			out[i].SOA = &soa
-		}
 	}
 	return out
 }
@@ -290,7 +310,7 @@ func capTTLs(rrs []dnsmsg.RR) []dnsmsg.RR {
 	if !capped {
 		return rrs
 	}
-	out := cloneRRs(rrs)
+	out := dnsmsg.CloneRRs(rrs)
 	for i := range out {
 		out[i].TTL = min(out[i].TTL, maxCacheTTL)
 	}

@@ -78,10 +78,24 @@ type Resolver struct {
 	roots        []net.IP // nil: the built-in root hints
 	port         string   // "": defaultUpstreamPort
 	allowPrivate bool     // permit querying loopback and private addresses
+
+	delegations *delegationCache
 }
 
-// New returns a Resolver that starts every resolution at the root servers.
-func New() *Resolver { return &Resolver{} }
+// New returns a Resolver that starts every resolution at the closest zone
+// it already knows the servers for, falling back to the root servers.
+func New() *Resolver {
+	return &Resolver{delegations: newDelegationCache(0)}
+}
+
+// startingPoint is where a resolution for qname begins: the deepest
+// delegation already known, or the root.
+func (r *Resolver) startingPoint(qname string) (zone string, servers []net.IP, cached bool) {
+	if zone, servers, ok := r.delegations.closestEnclosing(qname); ok {
+		return zone, servers, true
+	}
+	return ".", r.rootServers(), false
+}
 
 func (r *Resolver) rootServers() []net.IP {
 	if r.roots == nil {
@@ -142,11 +156,10 @@ func (r *Resolver) ResolveRR(ctx context.Context, qname string, qtype dnsmsg.RRT
 }
 
 func (r *Resolver) resolve(ctx context.Context, qname string, qtype dnsmsg.RRType, cnameDepth, glueDepth int) (Result, error) {
-	servers := r.rootServers()
 	// zone is what the servers we are currently talking to are authoritative
 	// for. It bounds what their answers are allowed to affect: a referral
 	// has to lead strictly below it, and glue has to be a name inside it.
-	zone := "."
+	zone, servers, fromCache := r.startingPoint(qname)
 
 	for referrals := 0; ; referrals++ {
 		if err := ctx.Err(); err != nil {
@@ -158,6 +171,14 @@ func (r *Resolver) resolve(ctx context.Context, qname string, qtype dnsmsg.RRTyp
 
 		resp, server, err := r.queryServers(ctx, servers, qname, qtype)
 		if err != nil {
+			if fromCache {
+				// The delegation we started from is no longer answering.
+				// Drop it and walk down from the root, so one stale entry
+				// cannot keep a whole zone unresolvable until it expires.
+				r.delegations.forget(zone)
+				zone, servers, fromCache = ".", r.rootServers(), false
+				continue
+			}
 			return Result{}, err
 		}
 
@@ -236,6 +257,7 @@ func (r *Resolver) resolve(ctx context.Context, qname string, qtype dnsmsg.RRTyp
 		//     server can keep pointing at the same zone (or back at the
 		//     root) and only maxReferrals stops it, 30 round trips later.
 		var newZone string
+		nsTTL := uint32(0)
 		nsNames := make(map[string]bool)
 		for _, rr := range resp.Authorities {
 			if rr.Type != dnsmsg.TypeNS || rr.Class != dnsmsg.ClassIN {
@@ -252,6 +274,9 @@ func (r *Resolver) resolve(ctx context.Context, qname string, qtype dnsmsg.RRTyp
 				continue
 			}
 			nsNames[strings.ToLower(rr.NS)] = true
+			if nsTTL == 0 || rr.TTL < nsTTL {
+				nsTTL = rr.TTL
+			}
 		}
 		if len(nsNames) == 0 {
 			// NODATA (RFC 2308 2.2): NOERROR with neither an answer nor a
@@ -313,8 +338,13 @@ func (r *Resolver) resolve(ctx context.Context, qname string, qtype dnsmsg.RRTyp
 			return Result{}, fmt.Errorf("could not resolve any name server address for delegation of %s", qname)
 		}
 
+		// Remember the delegation so the next name in this zone, whatever
+		// it is, can start here instead of at the root.
+		r.delegations.put(newZone, newServers, nsTTL)
+
 		servers = newServers
 		zone = newZone
+		fromCache = false
 	}
 }
 

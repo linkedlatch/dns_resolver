@@ -13,6 +13,7 @@ import (
 	"dns_resolver/middleware/acl"
 	"dns_resolver/middleware/cache"
 	"dns_resolver/middleware/ratelimit"
+	"dns_resolver/middleware/singleflight"
 	"dns_resolver/resolver"
 	"dns_resolver/resolverhandler"
 )
@@ -32,6 +33,7 @@ func main() {
 	// Innermost first: resolution, then cache, then the checks that should
 	// run before any work is done on a query.
 	handler := resolverhandler.New(resolver.New())
+	handler = singleflight.Wrap(handler)
 	handler = cache.Wrap(handler, 0)
 	handler = ratelimit.Wrap(handler, *rate, 0)
 	handler = acl.Wrap(handler, allowed)

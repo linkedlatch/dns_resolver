@@ -3,6 +3,7 @@
 package dnsmsg
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"net"
@@ -227,4 +228,30 @@ func Unpack(buf []byte) (*Message, error) {
 		return nil, fmt.Errorf("additional: %w", err)
 	}
 	return msg, nil
+}
+
+// CloneRRs copies rrs deeply enough that the result shares nothing mutable
+// with the original.
+//
+// Copying the structs alone is not enough: the address, RDATA and SOA
+// fields are a slice, a slice and a pointer, so plain assignment leaves two
+// records pointing at the same bytes. Anything that hands the same records
+// to more than one client - a cache, a de-duplicator - has to copy them, or
+// one client editing a record edits what the others were given.
+func CloneRRs(rrs []RR) []RR {
+	if len(rrs) == 0 {
+		return nil
+	}
+	out := make([]RR, len(rrs))
+	for i, rr := range rrs {
+		out[i] = rr
+		out[i].A = bytes.Clone(rr.A)
+		out[i].AAAA = bytes.Clone(rr.AAAA)
+		out[i].Raw = bytes.Clone(rr.Raw)
+		if rr.SOA != nil {
+			soa := *rr.SOA
+			out[i].SOA = &soa
+		}
+	}
+	return out
 }
