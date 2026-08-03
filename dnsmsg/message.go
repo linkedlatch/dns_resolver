@@ -16,6 +16,7 @@ const (
 	TypeCNAME RRType = 5
 	TypeSOA   RRType = 6
 	TypeAAAA  RRType = 28
+	TypeOPT   RRType = 41 // EDNS0 pseudo-record; see edns.go
 )
 
 func (t RRType) String() string {
@@ -30,6 +31,8 @@ func (t RRType) String() string {
 		return "SOA"
 	case TypeAAAA:
 		return "AAAA"
+	case TypeOPT:
+		return "OPT"
 	default:
 		return fmt.Sprintf("TYPE%d", uint16(t))
 	}

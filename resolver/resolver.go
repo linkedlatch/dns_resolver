@@ -212,12 +212,28 @@ func (r *Resolver) queryServers(servers []net.IP, qname string, qtype dnsmsg.RRT
 	return nil, nil, fmt.Errorf("all %d server(s) failed, last error: %w", len(servers), lastErr)
 }
 
+// query asks one server, preferring EDNS0 so that larger responses arrive
+// in a single UDP datagram instead of forcing a TCP retry. Servers too old
+// or too strict to accept an OPT record are retried the plain RFC 1035 way.
 func (r *Resolver) query(server net.IP, qname string, qtype dnsmsg.RRType) (*dnsmsg.Message, error) {
+	msg, err := r.queryOnce(server, qname, qtype, true)
+	if err == nil && ednsRefused(msg) {
+		return r.queryOnce(server, qname, qtype, false)
+	}
+	return msg, err
+}
+
+func (r *Resolver) queryOnce(server net.IP, qname string, qtype dnsmsg.RRType, useEDNS0 bool) (*dnsmsg.Message, error) {
 	id, err := randomQueryID()
 	if err != nil {
 		return nil, fmt.Errorf("generate query ID: %w", err)
 	}
-	packet, err := dnsmsg.PackQuery(id, qname, qtype)
+	var packet []byte
+	if useEDNS0 {
+		packet, err = dnsmsg.PackQueryEDNS0(id, qname, qtype, dnsmsg.DefaultUDPSize, false)
+	} else {
+		packet, err = dnsmsg.PackQuery(id, qname, qtype)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -233,6 +249,17 @@ func (r *Resolver) query(server net.IP, qname string, qtype dnsmsg.RRType) (*dns
 		}
 	}
 	return msg, nil
+}
+
+// ednsRefused reports whether a response looks like the server rejected our
+// query specifically because it carried an OPT record, rather than because
+// the name genuinely failed to resolve.
+func ednsRefused(msg *dnsmsg.Message) bool {
+	switch msg.ExtendedRCode() {
+	case uint16(dnsmsg.RCodeFormatError), uint16(dnsmsg.RCodeNotImplemented), dnsmsg.RCodeBadVers:
+		return true
+	}
+	return false
 }
 
 // randomQueryID uses crypto/rand rather than math/rand: the query ID is a
