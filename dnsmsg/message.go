@@ -115,6 +115,66 @@ func PackQuery(id uint16, name string, qtype RRType) ([]byte, error) {
 	return buf, nil
 }
 
+// Pack serializes a full DNS message to wire format, compressing repeated
+// domain names across the question/answer/authority/additional sections.
+// Header counts are derived from the length of each section, not from
+// msg.Header's count fields.
+func Pack(msg *Message) ([]byte, error) {
+	e := newEncoder()
+	e.buf = make([]byte, 12)
+
+	var flags1, flags2 uint8
+	if msg.Header.QR {
+		flags1 |= 0x80
+	}
+	flags1 |= (msg.Header.Opcode & 0x0F) << 3
+	if msg.Header.AA {
+		flags1 |= 0x04
+	}
+	if msg.Header.TC {
+		flags1 |= 0x02
+	}
+	if msg.Header.RD {
+		flags1 |= 0x01
+	}
+	if msg.Header.RA {
+		flags2 |= 0x80
+	}
+	flags2 |= uint8(msg.Header.RCode) & 0x0F
+
+	binary.BigEndian.PutUint16(e.buf[0:2], msg.Header.ID)
+	e.buf[2] = flags1
+	e.buf[3] = flags2
+	binary.BigEndian.PutUint16(e.buf[4:6], uint16(len(msg.Questions)))
+	binary.BigEndian.PutUint16(e.buf[6:8], uint16(len(msg.Answers)))
+	binary.BigEndian.PutUint16(e.buf[8:10], uint16(len(msg.Authorities)))
+	binary.BigEndian.PutUint16(e.buf[10:12], uint16(len(msg.Additionals)))
+
+	for _, q := range msg.Questions {
+		if err := e.writeName(q.Name); err != nil {
+			return nil, err
+		}
+		e.writeUint16(uint16(q.Type))
+		e.writeUint16(uint16(q.Class))
+	}
+	for _, rr := range msg.Answers {
+		if err := e.writeRR(rr); err != nil {
+			return nil, err
+		}
+	}
+	for _, rr := range msg.Authorities {
+		if err := e.writeRR(rr); err != nil {
+			return nil, err
+		}
+	}
+	for _, rr := range msg.Additionals {
+		if err := e.writeRR(rr); err != nil {
+			return nil, err
+		}
+	}
+	return e.buf, nil
+}
+
 // Unpack parses a full DNS message from wire format.
 func Unpack(buf []byte) (*Message, error) {
 	d := &decoder{buf: buf}

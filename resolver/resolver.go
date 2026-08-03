@@ -6,6 +6,7 @@ package resolver
 import (
 	"crypto/rand"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"net"
 	"strings"
@@ -22,6 +23,11 @@ const (
 	udpReadBufSize = 4096
 )
 
+// ErrNXDOMAIN indicates the queried name does not exist. Callers that need
+// to distinguish this from other resolution failures (e.g. a server mapping
+// it to RCODE 3) should check with errors.Is, not by matching error text.
+var ErrNXDOMAIN = errors.New("NXDOMAIN")
+
 type Resolver struct{}
 
 func New() *Resolver { return &Resolver{} }
@@ -30,10 +36,31 @@ func New() *Resolver { return &Resolver{} }
 // root servers and returns the resulting A/AAAA addresses, following any
 // CNAME chain along the way.
 func (r *Resolver) Resolve(qname string, qtype dnsmsg.RRType) ([]net.IP, error) {
+	rrs, err := r.ResolveRR(qname, qtype)
+	if err != nil {
+		return nil, err
+	}
+	ips := make([]net.IP, 0, len(rrs))
+	for _, rr := range rrs {
+		switch qtype {
+		case dnsmsg.TypeA:
+			ips = append(ips, rr.A)
+		case dnsmsg.TypeAAAA:
+			ips = append(ips, rr.AAAA)
+		}
+	}
+	return ips, nil
+}
+
+// ResolveRR performs iterative resolution like Resolve, but returns the
+// matching resource records themselves (preserving TTL) instead of just
+// their addresses. A DNS server answering client queries needs the TTL to
+// report accurate values (and, later, to drive cache expiry).
+func (r *Resolver) ResolveRR(qname string, qtype dnsmsg.RRType) ([]dnsmsg.RR, error) {
 	return r.resolve(qname, qtype, 0, 0)
 }
 
-func (r *Resolver) resolve(qname string, qtype dnsmsg.RRType, cnameDepth, glueDepth int) ([]net.IP, error) {
+func (r *Resolver) resolve(qname string, qtype dnsmsg.RRType, cnameDepth, glueDepth int) ([]dnsmsg.RR, error) {
 	servers := RootServers
 
 	for referrals := 0; ; referrals++ {
@@ -47,7 +74,7 @@ func (r *Resolver) resolve(qname string, qtype dnsmsg.RRType, cnameDepth, glueDe
 		}
 
 		if resp.Header.RCode == dnsmsg.RCodeNameError {
-			return nil, fmt.Errorf("NXDOMAIN: %s", qname)
+			return nil, fmt.Errorf("%w: %s", ErrNXDOMAIN, qname)
 		}
 		if resp.Header.RCode != dnsmsg.RCodeSuccess {
 			return nil, fmt.Errorf("%s answered %s query for %s with RCODE %d", server, qtype, qname, resp.Header.RCode)
@@ -58,7 +85,7 @@ func (r *Resolver) resolve(qname string, qtype dnsmsg.RRType, cnameDepth, glueDe
 		// remainder: servers commonly bundle the whole chain plus the
 		// final answer together in one response.
 		name := qname
-		var ips []net.IP
+		var answers []dnsmsg.RR
 		hops := 0
 		for {
 			var cnameTarget string
@@ -68,14 +95,14 @@ func (r *Resolver) resolve(qname string, qtype dnsmsg.RRType, cnameDepth, glueDe
 				}
 				switch {
 				case rr.Type == qtype && qtype == dnsmsg.TypeA && rr.A != nil:
-					ips = append(ips, rr.A)
+					answers = append(answers, rr)
 				case rr.Type == qtype && qtype == dnsmsg.TypeAAAA && rr.AAAA != nil:
-					ips = append(ips, rr.AAAA)
+					answers = append(answers, rr)
 				case rr.Type == dnsmsg.TypeCNAME:
 					cnameTarget = rr.CNAME
 				}
 			}
-			if len(ips) > 0 || cnameTarget == "" {
+			if len(answers) > 0 || cnameTarget == "" {
 				break
 			}
 			hops++
@@ -85,8 +112,8 @@ func (r *Resolver) resolve(qname string, qtype dnsmsg.RRType, cnameDepth, glueDe
 			name = cnameTarget
 		}
 
-		if len(ips) > 0 {
-			return ips, nil
+		if len(answers) > 0 {
+			return answers, nil
 		}
 		if name != qname {
 			return r.resolve(name, qtype, cnameDepth+hops, glueDepth)
@@ -129,11 +156,14 @@ func (r *Resolver) resolve(qname string, qtype dnsmsg.RRType, cnameDepth, glueDe
 				return nil, fmt.Errorf("referral for %s has no glue and glue lookup depth exceeded", qname)
 			}
 			for ns := range nsNames {
-				ips, err := r.resolve(ns, dnsmsg.TypeA, 0, glueDepth+1)
-				if err == nil && len(ips) > 0 {
-					newServers = ips
-					break
+				glueRRs, err := r.resolve(ns, dnsmsg.TypeA, 0, glueDepth+1)
+				if err != nil || len(glueRRs) == 0 {
+					continue
 				}
+				for _, rr := range glueRRs {
+					newServers = append(newServers, rr.A)
+				}
+				break
 			}
 		}
 		if len(newServers) == 0 {
