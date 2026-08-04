@@ -10,7 +10,7 @@ package resolverhandler
 import (
 	"context"
 	"errors"
-	"log"
+	"log/slog"
 
 	"dns_resolver/dnsmsg"
 	"dns_resolver/dnsserver"
@@ -22,12 +22,17 @@ import (
 const opcodeQuery = 0
 
 type handler struct {
-	r *resolver.Resolver
+	r      *resolver.Resolver
+	logger *slog.Logger
 }
 
-// New returns a Handler answering queries by resolving them with r.
-func New(r *resolver.Resolver) dnsserver.Handler {
-	return &handler{r: r}
+// New returns a Handler answering queries by resolving them with r. A nil
+// logger discards what would be logged.
+func New(r *resolver.Resolver, logger *slog.Logger) dnsserver.Handler {
+	if logger == nil {
+		logger = slog.New(slog.DiscardHandler)
+	}
+	return &handler{r: r, logger: logger}
 }
 
 func (h *handler) ServeDNS(ctx context.Context, w dnsserver.ResponseWriter, req *dnsmsg.Message) {
@@ -64,7 +69,8 @@ func (h *handler) ServeDNS(ctx context.Context, w dnsserver.ResponseWriter, req 
 		// Data that failed validation is data someone tampered with. The
 		// client is told the lookup failed rather than being handed it with
 		// a warning it has no way to act on (RFC 4035).
-		log.Printf("bogus answer for %s %s: %v", q.Name, q.Type, err)
+		h.logger.Warn("rejected bogus answer",
+			"name", q.Name, "type", q.Type.String(), "client", w.RemoteAddr().String(), "error", err)
 		resp.Header.RCode = dnsmsg.RCodeServerFailure
 	case err == nil:
 		// A NODATA result (name exists, no record of this type) arrives here
@@ -85,11 +91,16 @@ func (h *handler) ServeDNS(ctx context.Context, w dnsserver.ResponseWriter, req 
 			resp.Authorities = []dnsmsg.RR{*nxErr.SOA}
 		}
 	default:
-		log.Printf("resolve %s %s: %v", q.Name, q.Type, err)
+		h.logger.Info("resolution failed",
+			"name", q.Name, "type", q.Type.String(), "client", w.RemoteAddr().String(), "error", err)
 		resp.Header.RCode = dnsmsg.RCodeServerFailure
 	}
 
+	h.logger.Debug("answered",
+		"name", q.Name, "type", q.Type.String(), "rcode", uint8(resp.Header.RCode),
+		"answers", len(resp.Answers), "secure", resp.Header.AD)
+
 	if err := w.WriteMsg(resp); err != nil {
-		log.Printf("write response for %s %s: %v", q.Name, q.Type, err)
+		h.logger.Warn("write response", "name", q.Name, "type", q.Type.String(), "error", err)
 	}
 }

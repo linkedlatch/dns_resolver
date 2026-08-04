@@ -20,10 +20,10 @@ const (
 	maxReferrals   = 30 // guards against referral loops between misconfigured servers
 	maxCNAMEChain  = 15
 	maxGlueLookups = 6 // caps recursive lookups for NS addresses missing glue
-	queryTimeout   = 3 * time.Second
 	udpReadBufSize = 4096
 
-	defaultUpstreamPort = "53"
+	defaultUpstreamTimeout = 3 * time.Second
+	defaultUpstreamPort    = "53"
 )
 
 // ErrNXDOMAIN indicates the queried name does not exist. Callers that need
@@ -87,6 +87,34 @@ type Resolver struct {
 	keys     *keyCache
 	anchors  []dnsmsg.DS
 	clock    func() time.Time
+
+	timeout time.Duration // per exchange with one server; 0: default
+}
+
+// Options configure a Resolver. The zero value matches New(), so a caller
+// that only wants to change one thing does not have to know the rest - and
+// validation is phrased as something to turn off, so forgetting to mention
+// it leaves the resolver checking signatures.
+type Options struct {
+	// UpstreamTimeout bounds one exchange with one name server.
+	UpstreamTimeout time.Duration
+	// DisableDNSSEC serves answers without checking their signatures.
+	DisableDNSSEC bool
+}
+
+// NewWithOptions returns a Resolver configured by opt.
+func NewWithOptions(opt Options) *Resolver {
+	r := New()
+	r.timeout = opt.UpstreamTimeout
+	r.validate = !opt.DisableDNSSEC
+	return r
+}
+
+func (r *Resolver) upstreamTimeout() time.Duration {
+	if r.timeout > 0 {
+		return r.timeout
+	}
+	return defaultUpstreamTimeout
 }
 
 // New returns a Resolver that starts every resolution at the closest zone
@@ -474,12 +502,12 @@ func (r *Resolver) queryOnce(ctx context.Context, server net.IP, qname string, q
 	}
 
 	addr := net.JoinHostPort(server.String(), r.upstreamPort())
-	msg, err := queryUDP(ctx, addr, packet, id, qname, qtype)
+	msg, err := queryUDP(ctx, r.upstreamTimeout(), addr, packet, id, qname, qtype)
 	if err != nil {
 		return nil, err
 	}
 	if msg.Header.TC {
-		msg, err = queryTCP(ctx, addr, packet, id, qname, qtype)
+		msg, err = queryTCP(ctx, r.upstreamTimeout(), addr, packet, id, qname, qtype)
 		if err != nil {
 			return nil, err
 		}
@@ -511,8 +539,8 @@ func randomQueryID() (uint16, error) {
 
 // dial connects to one name server. queryTimeout bounds this socket; ctx
 // bounds the resolution it belongs to, and cancels the dial with it.
-func dial(ctx context.Context, network, addr string) (net.Conn, error) {
-	d := net.Dialer{Timeout: queryTimeout}
+func dial(ctx context.Context, network, addr string, timeout time.Duration) (net.Conn, error) {
+	d := net.Dialer{Timeout: timeout}
 	return d.DialContext(ctx, network, addr)
 }
 
@@ -520,21 +548,21 @@ func dial(ctx context.Context, network, addr string) (net.Conn, error) {
 // left of the whole query's budget. Without the second half, a resolution
 // that keeps finding servers to talk to has no end: every individual socket
 // stays inside its timeout while the client waits indefinitely.
-func socketDeadline(ctx context.Context) time.Time {
-	deadline := time.Now().Add(queryTimeout)
+func socketDeadline(ctx context.Context, timeout time.Duration) time.Time {
+	deadline := time.Now().Add(timeout)
 	if budget, ok := ctx.Deadline(); ok && budget.Before(deadline) {
 		return budget
 	}
 	return deadline
 }
 
-func queryUDP(ctx context.Context, addr string, packet []byte, id uint16, qname string, qtype dnsmsg.RRType) (*dnsmsg.Message, error) {
-	conn, err := dial(ctx, "udp", addr)
+func queryUDP(ctx context.Context, timeout time.Duration, addr string, packet []byte, id uint16, qname string, qtype dnsmsg.RRType) (*dnsmsg.Message, error) {
+	conn, err := dial(ctx, "udp", addr, timeout)
 	if err != nil {
 		return nil, err
 	}
 	defer conn.Close()
-	conn.SetDeadline(socketDeadline(ctx))
+	conn.SetDeadline(socketDeadline(ctx, timeout))
 
 	if _, err := conn.Write(packet); err != nil {
 		return nil, err
@@ -547,13 +575,13 @@ func queryUDP(ctx context.Context, addr string, packet []byte, id uint16, qname 
 	return unpackAndVerify(buf[:n], id, qname, qtype)
 }
 
-func queryTCP(ctx context.Context, addr string, packet []byte, id uint16, qname string, qtype dnsmsg.RRType) (*dnsmsg.Message, error) {
-	conn, err := dial(ctx, "tcp", addr)
+func queryTCP(ctx context.Context, timeout time.Duration, addr string, packet []byte, id uint16, qname string, qtype dnsmsg.RRType) (*dnsmsg.Message, error) {
+	conn, err := dial(ctx, "tcp", addr, timeout)
 	if err != nil {
 		return nil, err
 	}
 	defer conn.Close()
-	conn.SetDeadline(socketDeadline(ctx))
+	conn.SetDeadline(socketDeadline(ctx, timeout))
 
 	lenPrefix := make([]byte, 2)
 	binary.BigEndian.PutUint16(lenPrefix, uint16(len(packet)))

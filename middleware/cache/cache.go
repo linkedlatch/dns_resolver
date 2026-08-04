@@ -55,21 +55,46 @@ type entry struct {
 	elem        *list.Element
 }
 
+// Config sizes the cache and bounds how long entries live, whatever TTL
+// the answers carried. Zero fields take the built-in defaults.
+type Config struct {
+	MaxEntries int
+	MinTTL     time.Duration
+	MaxTTL     time.Duration
+}
+
+func (c Config) ttlBounds() (minTTL, maxTTL uint32) {
+	minTTL, maxTTL = minCacheTTL, maxCacheTTL
+	if c.MinTTL > 0 {
+		minTTL = uint32(c.MinTTL.Seconds())
+	}
+	if c.MaxTTL > 0 {
+		maxTTL = uint32(c.MaxTTL.Seconds())
+	}
+	return minTTL, maxTTL
+}
+
 // store is a TTL-aware, size-bounded (LRU-evicted) cache of DNS responses.
 type store struct {
 	mu         sync.Mutex
 	maxEntries int
+	minTTL     uint32
+	maxTTL     uint32
 	entries    map[key]*entry
 	order      *list.List       // front = most recently used
 	now        func() time.Time // replaced in tests, so expiry needs no sleeping
 }
 
-func newStore(maxEntries int) *store {
+func newStore(cfg Config) *store {
+	maxEntries := cfg.MaxEntries
 	if maxEntries <= 0 {
 		maxEntries = defaultMaxEntries
 	}
+	minTTL, maxTTL := cfg.ttlBounds()
 	return &store{
 		maxEntries: maxEntries,
+		minTTL:     minTTL,
+		maxTTL:     maxTTL,
 		entries:    make(map[key]*entry),
 		order:      list.New(),
 		now:        time.Now,
@@ -141,7 +166,7 @@ func (s *store) put(name string, qtype dnsmsg.RRType, rcode dnsmsg.RCode, answer
 	if ttl == 0 {
 		return // TTL 0 means "use this once, do not cache it" (RFC 2308)
 	}
-	ttl = clampTTL(ttl)
+	ttl = s.clampTTL(ttl)
 
 	k := normalizeKey(name, qtype)
 
@@ -195,8 +220,8 @@ func normalizeKey(name string, qtype dnsmsg.RRType) key {
 	return key{name: strings.ToLower(strings.TrimSuffix(name, ".")), qtype: qtype}
 }
 
-func clampTTL(ttl uint32) uint32 {
-	return min(max(ttl, minCacheTTL), maxCacheTTL)
+func (s *store) clampTTL(ttl uint32) uint32 {
+	return min(max(ttl, s.minTTL), s.maxTTL)
 }
 
 func withTTL(rrs []dnsmsg.RR, ttl uint32) []dnsmsg.RR {
@@ -238,10 +263,9 @@ type handler struct {
 }
 
 // Wrap returns a dnsserver.Handler that caches next's answers and serves
-// repeated queries from the cache within their TTL. maxEntries <= 0 uses a
-// built-in default.
-func Wrap(next dnsserver.Handler, maxEntries int) dnsserver.Handler {
-	return &handler{next: next, store: newStore(maxEntries)}
+// repeated queries from the cache within their TTL.
+func Wrap(next dnsserver.Handler, cfg Config) dnsserver.Handler {
+	return &handler{next: next, store: newStore(cfg)}
 }
 
 func (h *handler) ServeDNS(ctx context.Context, w dnsserver.ResponseWriter, req *dnsmsg.Message) {
@@ -267,7 +291,7 @@ func (h *handler) ServeDNS(ctx context.Context, w dnsserver.ResponseWriter, req 
 		return
 	}
 
-	rec := &recordingWriter{ResponseWriter: w}
+	rec := &recordingWriter{ResponseWriter: w, maxTTL: h.store.maxTTL}
 	h.next.ServeDNS(ctx, rec, req)
 	if rec.msg != nil {
 		h.store.put(q.Name, q.Type, rec.msg.Header.RCode, rec.msg.Answers, rec.msg.Authorities)
@@ -279,7 +303,8 @@ func (h *handler) ServeDNS(ctx context.Context, w dnsserver.ResponseWriter, req 
 // client.
 type recordingWriter struct {
 	dnsserver.ResponseWriter
-	msg *dnsmsg.Message
+	msg    *dnsmsg.Message
+	maxTTL uint32
 }
 
 func (w *recordingWriter) WriteMsg(msg *dnsmsg.Message) error {
@@ -290,8 +315,8 @@ func (w *recordingWriter) WriteMsg(msg *dnsmsg.Message) error {
 	// resolver holding an absurd TTL in its own cache is the same problem
 	// one step downstream - where we can no longer expire it.
 	out := *msg
-	out.Answers = capTTLs(msg.Answers)
-	out.Authorities = capTTLs(msg.Authorities)
+	out.Answers = w.capTTLs(msg.Answers)
+	out.Authorities = w.capTTLs(msg.Authorities)
 	return w.ResponseWriter.WriteMsg(&out)
 }
 
@@ -299,10 +324,10 @@ func (w *recordingWriter) WriteMsg(msg *dnsmsg.Message) error {
 // input when it is already within it. Only the ceiling is applied: raising
 // a short TTL is a decision about our own storage, not something to tell a
 // client about.
-func capTTLs(rrs []dnsmsg.RR) []dnsmsg.RR {
+func (w *recordingWriter) capTTLs(rrs []dnsmsg.RR) []dnsmsg.RR {
 	capped := false
 	for _, rr := range rrs {
-		if rr.TTL > maxCacheTTL {
+		if rr.TTL > w.maxTTL {
 			capped = true
 			break
 		}
@@ -312,7 +337,7 @@ func capTTLs(rrs []dnsmsg.RR) []dnsmsg.RR {
 	}
 	out := dnsmsg.CloneRRs(rrs)
 	for i := range out {
-		out[i].TTL = min(out[i].TTL, maxCacheTTL)
+		out[i].TTL = min(out[i].TTL, w.maxTTL)
 	}
 	return out
 }

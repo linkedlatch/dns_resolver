@@ -3,12 +3,14 @@ package main
 import (
 	"context"
 	"flag"
-	"log"
-	"net/netip"
+	"fmt"
+	"log/slog"
+	"os"
 	"os/signal"
-	"strings"
 	"syscall"
+	"time"
 
+	"dns_resolver/config"
 	"dns_resolver/dnsserver"
 	"dns_resolver/middleware/acl"
 	"dns_resolver/middleware/cache"
@@ -19,29 +21,35 @@ import (
 )
 
 func main() {
-	addr := flag.String("addr", "127.0.0.1:5353", "address to listen on for DNS queries (UDP and TCP)")
-	allow := flag.String("allow", "", "comma-separated CIDRs allowed to query this server (default: loopback only)")
-	rate := flag.Float64("rate", 0, "queries per second allowed per client address (0: built-in default)")
-	maxInFlight := flag.Int("max-in-flight", 0, "queries that may be resolved at once (0: built-in default)")
+	configPath := flag.String("config", "", "path to a JSON configuration file")
+	listen := flag.String("addr", "", "address to listen on, overriding the configuration")
 	flag.Parse()
 
-	allowed, err := parsePrefixes(*allow)
+	cfg, err := config.Load(*configPath)
 	if err != nil {
-		log.Fatalf("-allow: %v", err)
+		fmt.Fprintf(os.Stderr, "configuration: %v\n", err)
+		os.Exit(1)
+	}
+	if *listen != "" {
+		cfg.Listen = *listen
+	}
+	if err := cfg.Validate(); err != nil {
+		fmt.Fprintf(os.Stderr, "configuration: %v\n", err)
+		os.Exit(1)
 	}
 
-	// Innermost first: resolution, then cache, then the checks that should
-	// run before any work is done on a query.
-	handler := resolverhandler.New(resolver.New())
-	handler = singleflight.Wrap(handler)
-	handler = cache.Wrap(handler, 0)
-	handler = ratelimit.Wrap(handler, *rate, 0)
-	handler = acl.Wrap(handler, allowed)
+	logger := newLogger(cfg)
+	handler, err := buildHandler(cfg, logger)
+	if err != nil {
+		logger.Error("build handler", "error", err)
+		os.Exit(1)
+	}
 
 	srv := &dnsserver.Server{
-		Addr:        *addr,
-		Handler:     handler,
-		MaxInFlight: *maxInFlight,
+		Addr:         cfg.Listen,
+		Handler:      handler,
+		QueryTimeout: time.Duration(cfg.QueryTimeout),
+		MaxInFlight:  cfg.MaxInFlight,
 	}
 
 	// A signal cancels the context, which stops the listeners and lets the
@@ -49,24 +57,73 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	log.Printf("listening on %s (udp+tcp), answering %s", *addr, allowed)
+	logger.Info("listening",
+		"addr", cfg.Listen,
+		"allow", cfg.Allow,
+		"dnssec", cfg.DNSSEC,
+		"middleware", cfg.Middleware,
+	)
 	if err := srv.ListenAndServe(ctx); err != nil {
-		log.Fatal(err)
+		logger.Error("serve", "error", err)
+		os.Exit(1)
 	}
-	log.Print("shut down")
+	logger.Info("shut down")
 }
 
-func parsePrefixes(s string) ([]netip.Prefix, error) {
-	if strings.TrimSpace(s) == "" {
-		return acl.LoopbackOnly(), nil
+// buildHandler assembles the middleware chain named in the configuration
+// around the resolver, so the behaviour of the server can be changed
+// without rebuilding it.
+func buildHandler(cfg config.Config, logger *slog.Logger) (dnsserver.Handler, error) {
+	allowed, err := cfg.AllowedPrefixes()
+	if err != nil {
+		return nil, err
 	}
-	var out []netip.Prefix
-	for _, field := range strings.Split(s, ",") {
-		p, err := netip.ParsePrefix(strings.TrimSpace(field))
-		if err != nil {
-			return nil, err
+
+	r := resolver.NewWithOptions(resolver.Options{
+		UpstreamTimeout: time.Duration(cfg.UpstreamTimeout),
+		DisableDNSSEC:   !cfg.DNSSEC,
+	})
+	handler := resolverhandler.New(r, logger)
+
+	// The list reads outermost first, which is the order queries meet it,
+	// so it is applied in reverse.
+	for i := len(cfg.Middleware) - 1; i >= 0; i-- {
+		switch name := cfg.Middleware[i]; name {
+		case "acl":
+			handler = acl.Wrap(handler, allowed)
+		case "ratelimit":
+			handler = ratelimit.Wrap(handler, cfg.RateLimit, cfg.Burst)
+		case "cache":
+			handler = cache.Wrap(handler, cache.Config{
+				MaxEntries: cfg.CacheEntries,
+				MinTTL:     time.Duration(cfg.CacheMinTTL),
+				MaxTTL:     time.Duration(cfg.CacheMaxTTL),
+			})
+		case "singleflight":
+			handler = singleflight.Wrap(handler)
+		default:
+			return nil, fmt.Errorf("unknown middleware %q", name)
 		}
-		out = append(out, p)
 	}
-	return out, nil
+	return handler, nil
+}
+
+func newLogger(cfg config.Config) *slog.Logger {
+	var level slog.Level
+	switch cfg.LogLevel {
+	case "debug":
+		level = slog.LevelDebug
+	case "warn":
+		level = slog.LevelWarn
+	case "error":
+		level = slog.LevelError
+	default:
+		level = slog.LevelInfo
+	}
+
+	opts := &slog.HandlerOptions{Level: level}
+	if cfg.LogFormat == "json" {
+		return slog.New(slog.NewJSONHandler(os.Stderr, opts))
+	}
+	return slog.New(slog.NewTextHandler(os.Stderr, opts))
 }
