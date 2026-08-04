@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"dns_resolver/dnsmsg"
+	"dns_resolver/dnssec"
 )
 
 const (
@@ -288,6 +289,14 @@ func (r *Resolver) resolve(ctx context.Context, qname string, qtype dnsmsg.RRTyp
 			continue
 		}
 		if resp.Header.RCode == dnsmsg.RCodeNameError {
+			// A signed zone has to prove a name is missing, not just say so.
+			// Without the proof, anyone who can reach the client can erase
+			// any name in a signed zone by answering NXDOMAIN first.
+			if _, err := r.checkDenial(sec, resp.Authorities, func(nsecs []dnsmsg.RR) error {
+				return dnssec.ProveNameError(nsecs, qname)
+			}); err != nil {
+				return Result{}, fmt.Errorf("%w: NXDOMAIN for %s: %v", ErrBogus, qname, err)
+			}
 			return Result{}, newNXDOMAINError(qname, resp.Authorities)
 		}
 		if resp.Header.RCode != dnsmsg.RCodeSuccess {
@@ -406,7 +415,16 @@ func (r *Resolver) resolve(ctx context.Context, qname string, qtype dnsmsg.RRTyp
 			// turns the everyday "AAAA of an IPv4-only host" case into
 			// SERVFAIL. The SOA (absent in a "type 3" NODATA response) is
 			// passed along for the caller's negative caching.
-			return Result{Authority: soaAuthority(resp.Authorities)}, nil
+			//
+			// An empty answer from a signed zone has to be proven like any
+			// other: otherwise a forged one hides records that do exist.
+			proven, err := r.checkDenial(sec, resp.Authorities, func(nsecs []dnsmsg.RR) error {
+				return dnssec.ProveNoData(nsecs, qname, qtype)
+			})
+			if err != nil {
+				return Result{}, fmt.Errorf("%w: empty answer for %s %s: %v", ErrBogus, qname, qtype, err)
+			}
+			return Result{Authority: soaAuthority(resp.Authorities), Secure: proven}, nil
 		}
 
 		// Glue is a hint, not an answer: the addresses ride along in the

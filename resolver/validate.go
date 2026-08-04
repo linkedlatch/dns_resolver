@@ -100,15 +100,18 @@ func (r *Resolver) crossDelegation(ctx context.Context, parent secState, resp *d
 	dsSet := recordsOfType(resp.Authorities, dnsmsg.TypeDS, zone)
 	if len(dsSet) == 0 {
 		// No DS: the child is unsigned, and everything under it is
-		// unvalidated from here on.
-		//
-		// This is the one step taken on trust. Proving the absence of a DS
-		// needs the NSEC or NSEC3 records that would deny it, which this
-		// resolver does not yet check, so an attacker able to strip the DS
-		// records from a referral can downgrade a signed zone to unsigned.
+		// unvalidated from here on. The parent has to prove that, though -
+		// otherwise stripping the DS records out of a referral downgrades
+		// any signed zone to an unsigned one, and the chain of trust can be
+		// cut at every link.
+		if _, err := r.checkDenial(parent, resp.Authorities, func(nsecs []dnsmsg.RR) error {
+			return dnssec.ProveNoDS(nsecs, zone)
+		}); err != nil {
+			return insecure, fmt.Errorf("%w: unsigned delegation of %s: %v", ErrBogus, zone, err)
+		}
 		return insecure, nil
 	}
-	if err := r.verifyRRSet(dsSet, resp.Authorities, parent.keys); err != nil {
+	if _, err := r.verifyRRSet(dsSet, resp.Authorities, parent.keys); err != nil {
 		return insecure, fmt.Errorf("%w: DS for %s: %v", ErrBogus, zone, err)
 	}
 
@@ -121,6 +124,13 @@ func (r *Resolver) crossDelegation(ctx context.Context, parent secState, resp *d
 	keys, err := r.zoneKeys(ctx, zone, servers, anchors)
 	if err != nil {
 		return insecure, err
+	}
+	if len(keys) == 0 {
+		// The zone is signed only with algorithms this resolver cannot
+		// check. Carrying on as "secure with no keys" would make every
+		// answer below it fail for want of a signature we could never
+		// verify; unsigned is the honest description of what we know.
+		return insecure, nil
 	}
 	return secState{secure: true, keys: keys}, nil
 }
@@ -157,7 +167,7 @@ func (r *Resolver) zoneKeys(ctx context.Context, zone string, servers []net.IP, 
 		for i := range anchors {
 			switch err := dnssec.VerifyDS(zone, key, &anchors[i]); {
 			case err == nil:
-				if err := r.verifyRRSetWithKeys(keySet, resp.Answers, []*dnsmsg.DNSKEY{key}); err == nil {
+				if _, err := r.verifyRRSetWithKeys(keySet, resp.Answers, []*dnsmsg.DNSKEY{key}); err == nil {
 					verified = true
 				} else if errors.Is(err, dnssec.ErrUnsupportedAlgorithm) {
 					unsupported = true
@@ -188,21 +198,23 @@ func (r *Resolver) zoneKeys(ctx context.Context, zone string, servers []net.IP, 
 }
 
 // verifyRRSet checks that rrset is covered by a valid signature from one of
-// keys, with sigs being the section the RRSIGs arrived in.
-func (r *Resolver) verifyRRSet(rrset []dnsmsg.RR, sigs []dnsmsg.RR, keys []*dnsmsg.DNSKEY) error {
+// keys, with sigs being the section the RRSIGs arrived in. It returns the
+// signature that checked out, which says more than "valid": how many labels
+// the signer wrote down is what reveals a wildcard.
+func (r *Resolver) verifyRRSet(rrset []dnsmsg.RR, sigs []dnsmsg.RR, keys []*dnsmsg.DNSKEY) (*dnsmsg.RRSIG, error) {
 	return r.verifyRRSetWithKeys(rrset, sigs, keys)
 }
 
-func (r *Resolver) verifyRRSetWithKeys(rrset []dnsmsg.RR, section []dnsmsg.RR, keys []*dnsmsg.DNSKEY) error {
+func (r *Resolver) verifyRRSetWithKeys(rrset []dnsmsg.RR, section []dnsmsg.RR, keys []*dnsmsg.DNSKEY) (*dnsmsg.RRSIG, error) {
 	if len(rrset) == 0 {
-		return errors.New("nothing to verify")
+		return nil, errors.New("nothing to verify")
 	}
 	if len(keys) == 0 {
-		return errors.New("no keys to verify with")
+		return nil, errors.New("no keys to verify with")
 	}
 	covering := rrsigsFor(section, rrset[0].Name, rrset[0].Type)
 	if len(covering) == 0 {
-		return fmt.Errorf("no RRSIG covers %s %s", rrset[0].Name, rrset[0].Type)
+		return nil, fmt.Errorf("no RRSIG covers %s %s", rrset[0].Name, rrset[0].Type)
 	}
 
 	var lastErr error
@@ -211,7 +223,7 @@ func (r *Resolver) verifyRRSetWithKeys(rrset []dnsmsg.RR, section []dnsmsg.RR, k
 		for _, key := range keys {
 			err := dnssec.VerifyRRSet(rrset, sig, key, r.now())
 			if err == nil {
-				return nil
+				return sig, nil
 			}
 			if errors.Is(err, dnssec.ErrUnsupportedAlgorithm) {
 				unsupported = true
@@ -220,9 +232,9 @@ func (r *Resolver) verifyRRSetWithKeys(rrset []dnsmsg.RR, section []dnsmsg.RR, k
 		}
 	}
 	if unsupported {
-		return dnssec.ErrUnsupportedAlgorithm
+		return nil, dnssec.ErrUnsupportedAlgorithm
 	}
-	return lastErr
+	return nil, lastErr
 }
 
 // rrsigsFor picks the signatures in a section that claim to cover a
@@ -323,7 +335,7 @@ func (r *Resolver) validateAnswer(sec secState, resp *dnsmsg.Message, records []
 		seen[k] = true
 
 		rrset := recordsOfType(records, rr.Type, rr.Name)
-		err := r.verifyRRSet(rrset, resp.Answers, sec.keys)
+		sig, err := r.verifyRRSet(rrset, resp.Answers, sec.keys)
 		switch {
 		case err == nil:
 		case errors.Is(err, dnssec.ErrUnsupportedAlgorithm):
@@ -333,6 +345,77 @@ func (r *Resolver) validateAnswer(sec secState, resp *dnsmsg.Message, records []
 		default:
 			return false, fmt.Errorf("%w: %s %s: %v", ErrBogus, rr.Name, rr.Type, err)
 		}
+
+		// A signature made for a wildcard fits every name in the zone, so a
+		// valid one is not by itself evidence that this name was the one
+		// answered for. The zone owes a proof that the name has nothing of
+		// its own (RFC 4035 5.3.4); without it, one signed wildcard answer
+		// could be replayed as the answer for any name under it.
+		if dnssec.IsWildcardExpansion(rr.Name, sig) {
+			proven, err := r.checkDenial(sec, resp.Authorities, func(nsecs []dnsmsg.RR) error {
+				return dnssec.ProveNoCloserMatch(nsecs, rr.Name)
+			})
+			if err != nil {
+				return false, fmt.Errorf("%w: %s %s: %v", ErrBogus, rr.Name, rr.Type, err)
+			}
+			if !proven {
+				return false, nil
+			}
+		}
 	}
 	return true, nil
+}
+
+// checkDenial runs one of the proofs in the dnssec package over the NSEC
+// records of a response, having first checked that those records are
+// themselves signed by the zone.
+//
+// It separates three outcomes that a plain error cannot. A proof that holds
+// returns true. A proof in a form not checked here - NSEC3 - returns false
+// without an error, because a resolver that cannot read the evidence has
+// learned nothing either way and should treat the data as unvalidated
+// rather than as an attack. Anything else is an error: the response owed a
+// proof and did not produce one.
+func (r *Resolver) checkDenial(sec secState, section []dnsmsg.RR, prove func([]dnsmsg.RR) error) (bool, error) {
+	if !r.validate || !sec.secure {
+		return false, nil
+	}
+	switch err := prove(r.verifiedNSECs(section, sec.keys)); {
+	case err == nil:
+		return true, nil
+	case errors.Is(err, dnssec.ErrUnsupportedDenial), errors.Is(err, dnssec.ErrUnsupportedAlgorithm):
+		return false, nil
+	default:
+		return false, err
+	}
+}
+
+// verifiedNSECs returns the denial records of a section that carry a valid
+// signature, dropping the rest.
+//
+// Unsigned NSEC records are worth nothing: the point of a gap is that the
+// zone committed to it in advance, and anyone can write one down. NSEC3
+// records are passed through unverified because nothing here reads them
+// either way - their presence only tells the proof which form it is looking
+// at, and the caller treats that as "not checked".
+func (r *Resolver) verifiedNSECs(section []dnsmsg.RR, keys []*dnsmsg.DNSKEY) []dnsmsg.RR {
+	var out []dnsmsg.RR
+	checked := make(map[string]bool)
+	for _, rr := range section {
+		switch rr.Type {
+		case dnsmsg.TypeNSEC3:
+			out = append(out, rr)
+		case dnsmsg.TypeNSEC:
+			owner := normalizeName(rr.Name)
+			if checked[owner] {
+				continue
+			}
+			checked[owner] = true
+			rrset := recordsOfType(section, dnsmsg.TypeNSEC, rr.Name)
+			if _, err := r.verifyRRSet(rrset, section, keys); err == nil {
+				out = append(out, rrset...)
+			}
+		}
+	}
+	return out
 }

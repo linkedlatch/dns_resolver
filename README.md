@@ -96,6 +96,8 @@ walk from the root again, and the validated DNSKEY set for each signed zone.
   truncation
 - DNSSEC validation from the root trust anchor, with the AD bit on answers
   proven authentic and SERVFAIL for ones that fail
+- NSEC denial of existence: an unsigned delegation, an NXDOMAIN, an empty
+  answer and a wildcard expansion each have to be proven, not just asserted
 - QNAME minimization (RFC 9156), optional 0x20 encoding
 - Root priming (RFC 8109), IPv4 and IPv6 root servers
 - Caching of positive, NODATA, NXDOMAIN and SERVFAIL answers, with the
@@ -107,10 +109,12 @@ walk from the root again, and the validated DNSKEY set for each signed zone.
 
 ## Limitations
 
-- **Denial of existence is not proven.** NSEC and NSEC3 records are parsed
-  but not checked, so a zone that appears unsigned is taken at its word: an
-  attacker able to strip DS records from a referral can downgrade a signed
-  zone to unsigned.
+- **NSEC3 denial of existence is not checked.** Its records are parsed but
+  their hashed names are not, so a zone using NSEC3 - which is most of the
+  popular TLDs - is still taken at its word when it says a delegation is
+  unsigned. An attacker able to strip the DS records from such a referral
+  can downgrade a signed zone to unsigned. The same attack against an
+  NSEC-signed zone is now rejected.
 - **No RFC 5011 key rollover.** The root trust anchor is compiled in, so a
   root key rollover means shipping a new binary.
 - **No DNS-over-HTTPS**, no zone data of its own, no forwarding mode.
