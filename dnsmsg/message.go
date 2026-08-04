@@ -68,6 +68,8 @@ type Header struct {
 	TC      bool
 	RD      bool
 	RA      bool
+	AD      bool // the answer was validated by this resolver (RFC 4035)
+	CD      bool // the client asked for validation to be skipped
 	RCode   RCode
 	QDCount uint16
 	ANCount uint16
@@ -162,6 +164,12 @@ func Pack(msg *Message) ([]byte, error) {
 	}
 	if msg.Header.RA {
 		flags2 |= 0x80
+	}
+	if msg.Header.AD {
+		flags2 |= 0x20
+	}
+	if msg.Header.CD {
+		flags2 |= 0x10
 	}
 	flags2 |= uint8(msg.Header.RCode) & 0x0F
 

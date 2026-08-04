@@ -161,6 +161,8 @@ func (d *decoder) readHeader() (Header, error) {
 	h.TC = flags1&0x02 != 0
 	h.RD = flags1&0x01 != 0
 	h.RA = flags2&0x80 != 0
+	h.AD = flags2&0x20 != 0
+	h.CD = flags2&0x10 != 0
 	h.RCode = RCode(flags2 & 0x0F)
 	h.QDCount = qd
 	h.ANCount = an

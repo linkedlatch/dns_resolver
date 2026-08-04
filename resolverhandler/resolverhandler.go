@@ -60,12 +60,21 @@ func (h *handler) ServeDNS(ctx context.Context, w dnsserver.ResponseWriter, req 
 	res, err := h.r.ResolveRR(ctx, q.Name, q.Type)
 	var nxErr *resolver.NXDOMAINError
 	switch {
+	case errors.Is(err, resolver.ErrBogus):
+		// Data that failed validation is data someone tampered with. The
+		// client is told the lookup failed rather than being handed it with
+		// a warning it has no way to act on (RFC 4035).
+		log.Printf("bogus answer for %s %s: %v", q.Name, q.Type, err)
+		resp.Header.RCode = dnsmsg.RCodeServerFailure
 	case err == nil:
 		// A NODATA result (name exists, no record of this type) arrives here
 		// too, as an empty answer section plus the zone's SOA: NOERROR with
 		// no answers is the correct reply for it, not an error.
 		resp.Answers = res.Answers
 		resp.Authorities = res.Authority
+		// AD tells the client we checked the signatures ourselves, which is
+		// the only thing it can go on: it did not see them.
+		resp.Header.AD = res.Secure
 	case errors.As(err, &nxErr):
 		resp.Header.RCode = dnsmsg.RCodeNameError
 		if nxErr.SOA != nil {

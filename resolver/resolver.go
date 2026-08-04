@@ -80,12 +80,23 @@ type Resolver struct {
 	allowPrivate bool     // permit querying loopback and private addresses
 
 	delegations *delegationCache
+
+	// validate turns on DNSSEC: signatures are requested and checked, and a
+	// response that fails is an error rather than an answer.
+	validate bool
+	keys     *keyCache
+	anchors  []dnsmsg.DS
+	clock    func() time.Time
 }
 
 // New returns a Resolver that starts every resolution at the closest zone
 // it already knows the servers for, falling back to the root servers.
 func New() *Resolver {
-	return &Resolver{delegations: newDelegationCache(0)}
+	return &Resolver{
+		delegations: newDelegationCache(0),
+		validate:    true,
+		keys:        newKeyCache(),
+	}
 }
 
 // startingPoint is where a resolution for qname begins: the deepest
@@ -122,6 +133,12 @@ func (r *Resolver) upstreamPort() string {
 type Result struct {
 	Answers   []dnsmsg.RR
 	Authority []dnsmsg.RR
+
+	// Secure reports that every record in Answers was covered by a valid
+	// signature chaining back to the root trust anchor. False means only
+	// that the data was not proven authentic - most of the internet is
+	// still unsigned - not that anything was wrong with it.
+	Secure bool
 }
 
 // Resolve performs iterative resolution of qname/qtype starting from the
@@ -160,6 +177,10 @@ func (r *Resolver) resolve(ctx context.Context, qname string, qtype dnsmsg.RRTyp
 	// for. It bounds what their answers are allowed to affect: a referral
 	// has to lead strictly below it, and glue has to be a name inside it.
 	zone, servers, fromCache := r.startingPoint(qname)
+	sec, err := r.startingSecurity(ctx, zone, servers)
+	if err != nil {
+		return Result{}, err
+	}
 
 	for referrals := 0; ; referrals++ {
 		if err := ctx.Err(); err != nil {
@@ -172,11 +193,15 @@ func (r *Resolver) resolve(ctx context.Context, qname string, qtype dnsmsg.RRTyp
 		resp, server, err := r.queryServers(ctx, servers, qname, qtype)
 		if err != nil {
 			if fromCache {
+				sec = insecure
 				// The delegation we started from is no longer answering.
 				// Drop it and walk down from the root, so one stale entry
 				// cannot keep a whole zone unresolvable until it expires.
 				r.delegations.forget(zone)
 				zone, servers, fromCache = ".", r.rootServers(), false
+				if sec, err = r.startingSecurity(ctx, zone, servers); err != nil {
+					return Result{}, err
+				}
 				continue
 			}
 			return Result{}, err
@@ -231,7 +256,12 @@ func (r *Resolver) resolve(ctx context.Context, qname string, qtype dnsmsg.RRTyp
 		}
 
 		if len(answers) > 0 {
-			return Result{Answers: append(chain, answers...)}, nil
+			all := append(chain, answers...)
+			secure, err := r.validateAnswer(sec, resp, all)
+			if err != nil {
+				return Result{}, err
+			}
+			return Result{Answers: all, Secure: secure}, nil
 		}
 		if name != qname {
 			// The chain left what this server knows about; resolve the
@@ -241,7 +271,12 @@ func (r *Resolver) resolve(ctx context.Context, qname string, qtype dnsmsg.RRTyp
 			if err != nil {
 				return Result{}, err
 			}
+			chainSecure, err := r.validateAnswer(sec, resp, chain)
+			if err != nil {
+				return Result{}, err
+			}
 			res.Answers = append(chain, res.Answers...)
+			res.Secure = res.Secure && chainSecure
 			return res, nil
 		}
 
@@ -338,6 +373,12 @@ func (r *Resolver) resolve(ctx context.Context, qname string, qtype dnsmsg.RRTyp
 			return Result{}, fmt.Errorf("could not resolve any name server address for delegation of %s", qname)
 		}
 
+		if r.validate {
+			if sec, err = r.crossDelegation(ctx, sec, resp, newZone, newServers); err != nil {
+				return Result{}, err
+			}
+		}
+
 		// Remember the delegation so the next name in this zone, whatever
 		// it is, can start here instead of at the root.
 		r.delegations.put(newZone, newServers, nsTTL)
@@ -420,7 +461,11 @@ func (r *Resolver) queryOnce(ctx context.Context, server net.IP, qname string, q
 	}
 	var packet []byte
 	if edns == withEDNS0 {
-		packet, err = dnsmsg.PackQueryEDNS0(id, qname, qtype, dnsmsg.DefaultUDPSize, dnsmsg.NoDNSSEC)
+		do := dnsmsg.NoDNSSEC
+		if r.validate {
+			do = dnsmsg.RequestDNSSEC
+		}
+		packet, err = dnsmsg.PackQueryEDNS0(id, qname, qtype, dnsmsg.DefaultUDPSize, do)
 	} else {
 		packet, err = dnsmsg.PackQuery(id, qname, qtype)
 	}
