@@ -110,7 +110,25 @@ func (d *decoder) readName() (string, error) {
 		if nameLen > maxNameLength {
 			return "", fmt.Errorf("name exceeds maximum length of %d bytes", maxNameLength)
 		}
-		labels = append(labels, string(d.buf[pos:pos+int(length)]))
+
+		label := string(d.buf[pos : pos+int(length)])
+		// A label may hold any octet, including the dot this package uses to
+		// separate them. Names are Go strings everywhere above this line -
+		// compared, cached and re-encoded as strings - so a label with a dot
+		// in it stops being one name: the two labels "a.b" and "com" and the
+		// three labels "a", "b" and "com" both read as "a.b.com", and what
+		// gets written back out is not what arrived.
+		//
+		// Escaping the dot is the other way to fix this, and is what a
+		// resolver that carries names in presentation format does. It would
+		// mean every comparison, every cache key and the canonical form
+		// DNSSEC signs over all having to know about the escape. Refusing the
+		// name is a smaller thing to be sure of, and costs nothing anyone
+		// uses: no zone in practice puts a dot inside a label.
+		if strings.Contains(label, ".") {
+			return "", fmt.Errorf("label %q at offset %d contains a dot, which cannot be told from a label separator", label, pos)
+		}
+		labels = append(labels, label)
 		pos += int(length)
 	}
 
