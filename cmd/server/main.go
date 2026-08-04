@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"dns_resolver/config"
+	"dns_resolver/dnsmsg"
 	"dns_resolver/dnsserver"
 	"dns_resolver/middleware/acl"
 	"dns_resolver/middleware/cache"
@@ -75,6 +76,7 @@ func main() {
 		"tls_addr", cfg.TLSListen,
 		"allow", cfg.Allow,
 		"dnssec", cfg.DNSSEC,
+		"trust_anchor", cfg.TrustAnchor,
 		"middleware", cfg.Middleware,
 	)
 	if err := srv.ListenAndServe(ctx); err != nil {
@@ -93,11 +95,22 @@ func buildHandler(cfg config.Config, logger *slog.Logger) (dnsserver.Handler, er
 		return nil, err
 	}
 
+	var anchors []dnsmsg.DS
+	if cfg.TrustAnchor != "" {
+		// Failing to start beats starting with the wrong anchors: a resolver
+		// that quietly fell back to the built-in copy would validate against
+		// a key the operator had deliberately replaced.
+		if anchors, err = resolver.LoadTrustAnchors(cfg.TrustAnchor); err != nil {
+			return nil, fmt.Errorf("trust anchor: %w", err)
+		}
+	}
+
 	r := resolver.NewWithOptions(resolver.Options{
 		UpstreamTimeout:          time.Duration(cfg.UpstreamTimeout),
 		DisableDNSSEC:            !cfg.DNSSEC,
 		DisableQNAMEMinimization: !cfg.QNAMEMinimization,
 		Use0x20:                  cfg.Use0x20,
+		TrustAnchors:             anchors,
 	})
 	handler := resolverhandler.New(r, logger)
 

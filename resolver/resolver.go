@@ -114,6 +114,10 @@ type Options struct {
 	// against forged replies. Off by default, as unbound has it: a server
 	// that normalizes the case it echoes back breaks resolution outright.
 	Use0x20 bool
+	// TrustAnchors replaces the built-in root anchors, which is what makes
+	// a root key rollover something other than a rebuild. Nil keeps the
+	// compiled-in set.
+	TrustAnchors []dnsmsg.DS
 }
 
 // NewWithOptions returns a Resolver configured by opt.
@@ -123,6 +127,7 @@ func NewWithOptions(opt Options) *Resolver {
 	r.validate = !opt.DisableDNSSEC
 	r.minimize = !opt.DisableQNAMEMinimization
 	r.use0x20 = opt.Use0x20
+	r.anchors = opt.TrustAnchors
 	return r
 }
 
@@ -147,11 +152,11 @@ func New() *Resolver {
 
 // startingPoint is where a resolution for qname begins: the deepest
 // delegation already known, or the root.
-func (r *Resolver) startingPoint(qname string) (zone string, servers []net.IP, cached bool) {
-	if zone, servers, ok := r.delegations.closestEnclosing(qname); ok {
-		return zone, servers, true
+func (r *Resolver) startingPoint(qname string) (zone string, servers []net.IP, secure, cached bool) {
+	if zone, servers, secure, ok := r.delegations.closestEnclosing(qname); ok {
+		return zone, servers, secure, true
 	}
-	return ".", r.rootServers(), false
+	return ".", r.rootServers(), false, false
 }
 
 func (r *Resolver) rootServers() []net.IP {
@@ -228,10 +233,22 @@ func (r *Resolver) resolve(ctx context.Context, qname string, qtype dnsmsg.RRTyp
 	if r.roots == nil {
 		r.primeRootServers(ctx)
 	}
-	zone, servers, fromCache := r.startingPoint(qname)
+	zone, servers, wasSecure, fromCache := r.startingPoint(qname)
 	sec, err := r.startingSecurity(ctx, zone, servers)
 	if err != nil {
 		return Result{}, err
+	}
+
+	// A cached delegation is a shortcut through a walk that was validated
+	// when it was made. Taking it after the zone's keys have expired out of
+	// the key cache would answer everything below it unchecked - the walk
+	// would never pass a signature again - so the shortcut is given up
+	// rather than the validation.
+	if wasSecure && !sec.secure && r.validate && !checkingDisabled(ctx) {
+		zone, servers, fromCache = ".", r.rootServers(), false
+		if sec, err = r.startingSecurity(ctx, zone, servers); err != nil {
+			return Result{}, err
+		}
 	}
 
 	// minimizeOff records that this server would not play along with a
@@ -498,8 +515,12 @@ func (r *Resolver) resolve(ctx context.Context, qname string, qtype dnsmsg.RRTyp
 		}
 
 		// Remember the delegation so the next name in this zone, whatever
-		// it is, can start here instead of at the root.
-		r.delegations.put(newZone, newServers, nsTTL)
+		// it is, can start here instead of at the root. Not for a walk that
+		// skipped validation, though: the entry would be reused by queries
+		// that did want it, and it carries no record of having been checked.
+		if !checkingDisabled(ctx) {
+			r.delegations.put(newZone, newServers, nsTTL, sec.secure)
+		}
 
 		servers = newServers
 		zone = newZone

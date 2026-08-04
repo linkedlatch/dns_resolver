@@ -66,6 +66,12 @@ type Config struct {
 	// unchecked and never marked authentic.
 	DNSSEC bool `json:"dnssec"`
 
+	// TrustAnchor is a file of DS records for the root zone, replacing the
+	// one compiled in. It is how a root key rollover is followed without a
+	// new binary: IANA publishes the current anchors, and this points at
+	// them. Empty means use the built-in copy.
+	TrustAnchor string `json:"trust_anchor"`
+
 	// Middleware names the wrappers to build around the resolver, outermost
 	// first, so the chain can be changed without recompiling.
 	Middleware []string `json:"middleware"`

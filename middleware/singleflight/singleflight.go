@@ -42,7 +42,10 @@ func Wrap(next dnsserver.Handler) dnsserver.Handler {
 }
 
 func (h *handler) ServeDNS(ctx context.Context, w dnsserver.ResponseWriter, req *dnsmsg.Message) {
-	if len(req.Questions) != 1 {
+	// Collapsing a query with CD into one without it, or the other way
+	// round, would answer one of them with the other's data: they ask for
+	// different treatment of the same name.
+	if len(req.Questions) != 1 || req.Header.CD {
 		h.next.ServeDNS(ctx, w, req)
 		return
 	}

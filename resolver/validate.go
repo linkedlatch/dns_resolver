@@ -34,6 +34,28 @@ type secState struct {
 // can be validated, and nothing further down claims to be.
 var insecure = secState{}
 
+// checkingDisabledKey marks a resolution the caller asked not to be
+// validated. It rides on the context because it belongs to one query rather
+// than to the resolver, which is shared by every client.
+type checkingDisabledKey struct{}
+
+// WithoutValidation returns a context in which resolution does not check
+// signatures, and so does not refuse an answer for failing.
+//
+// It exists for the CD bit of RFC 4035 3.2.2: a client that sets it is
+// saying it would rather see the data and judge for itself than be told
+// the lookup failed. That is the only way to tell a zone with broken
+// signatures apart from a server that cannot be reached, which is what
+// anyone diagnosing the first of those needs.
+func WithoutValidation(ctx context.Context) context.Context {
+	return context.WithValue(ctx, checkingDisabledKey{}, true)
+}
+
+func checkingDisabled(ctx context.Context) bool {
+	disabled, _ := ctx.Value(checkingDisabledKey{}).(bool)
+	return disabled
+}
+
 // keyCache holds DNSKEY sets that have already been validated, so a
 // resolution does not re-fetch and re-verify the root and TLD keys every
 // time. Entries are dropped by TTL like any other DNS data.
@@ -372,7 +394,7 @@ func normalizeName(name string) string {
 // have already been checked. When validation is off, or nothing is known
 // about the starting zone, the walk proceeds unvalidated.
 func (r *Resolver) startingSecurity(ctx context.Context, zone string, servers []net.IP) (secState, error) {
-	if !r.validate {
+	if !r.validate || checkingDisabled(ctx) {
 		return insecure, nil
 	}
 	if normalizeName(zone) == "" {

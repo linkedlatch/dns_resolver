@@ -39,6 +39,7 @@ $ ./server -config resolver.json
   "listen": "127.0.0.1:5353",
   "allow": ["127.0.0.0/8", "10.0.0.0/8"],
   "dnssec": true,
+  "trust_anchor": "/etc/dns_resolver/root.anchors",
   "qname_minimization": true,
   "middleware": ["acl", "ratelimit", "cache", "singleflight"],
   "log_format": "json"
@@ -99,6 +100,10 @@ walk from the root again, and the validated DNSKEY set for each signed zone.
 - Denial of existence with NSEC and NSEC3, including opt-out: an unsigned
   delegation, an NXDOMAIN, an empty answer and a wildcard expansion each
   have to be proven, not just asserted
+- Root trust anchors from a file of DS records, so a key rollover is a
+  configuration change rather than a rebuild
+- The CD bit, for a client that would rather see data that failed
+  validation than be told the lookup failed
 - QNAME minimization (RFC 9156), optional 0x20 encoding
 - Root priming (RFC 8109), IPv4 and IPv6 root servers
 - Caching of positive, NODATA, NXDOMAIN and SERVFAIL answers, with the
@@ -110,8 +115,11 @@ walk from the root again, and the validated DNSKEY set for each signed zone.
 
 ## Limitations
 
-- **No RFC 5011 key rollover.** The root trust anchor is compiled in, so a
-  root key rollover means shipping a new binary.
+- **No RFC 5011 key rollover.** New root keys are not picked up
+  automatically; `trust_anchor` has to be updated by hand, and the
+  built-in anchors are only as fresh as the binary.
+- **A CD query gets the data but not the signatures**, which this resolver
+  does not pass on, so a client cannot validate for itself.
 - NSEC3 hashing is capped at 100 iterations; a zone asking for more is
   treated as unvalidatable rather than as an attack, since the work is
   ours to do and the protection it buys is negligible (RFC 9276).

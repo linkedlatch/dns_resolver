@@ -275,7 +275,12 @@ func Wrap(next dnsserver.Handler, cfg Config) dnsserver.Handler {
 }
 
 func (h *handler) ServeDNS(ctx context.Context, w dnsserver.ResponseWriter, req *dnsmsg.Message) {
-	if len(req.Questions) != 1 {
+	// A query with CD asks for data that was not validated. Letting it
+	// share a cache with ordinary queries would either hand that data to
+	// clients that did want it checked, or hide a validated answer behind
+	// an unvalidated one; either way the cache would be answering a
+	// different question from the one that filled it.
+	if len(req.Questions) != 1 || req.Header.CD {
 		h.next.ServeDNS(ctx, w, req)
 		return
 	}

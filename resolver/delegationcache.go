@@ -38,8 +38,13 @@ type delegationCache struct {
 
 type delegationEntry struct {
 	servers []net.IP
-	expiry  time.Time
-	elem    *list.Element
+	// secure records that this delegation was reached through a validated
+	// chain. Resuming a resolution here is only sound if the keys for the
+	// zone are still known; without that it has to be reached again from
+	// the root, or everything under it is answered unchecked.
+	secure bool
+	expiry time.Time
+	elem   *list.Element
 }
 
 func newDelegationCache(maxEntries int) *delegationCache {
@@ -57,9 +62,9 @@ func newDelegationCache(maxEntries int) *delegationCache {
 // closestEnclosing returns the deepest cached zone that qname sits under,
 // with the servers for it, so a resolution can start partway down the tree
 // instead of at the root.
-func (c *delegationCache) closestEnclosing(qname string) (zone string, servers []net.IP, ok bool) {
+func (c *delegationCache) closestEnclosing(qname string) (zone string, servers []net.IP, secure, ok bool) {
 	if c == nil {
-		return ".", nil, false
+		return ".", nil, false, false
 	}
 	name := normalizeZone(qname)
 
@@ -70,12 +75,12 @@ func (c *delegationCache) closestEnclosing(qname string) (zone string, servers [
 		if e, found := c.entries[name]; found {
 			if e.expiry.After(c.now()) {
 				c.order.MoveToFront(e.elem)
-				return zoneName(name), append([]net.IP(nil), e.servers...), true
+				return zoneName(name), append([]net.IP(nil), e.servers...), e.secure, true
 			}
 			c.remove(name, e)
 		}
 		if name == "" {
-			return ".", nil, false
+			return ".", nil, false, false
 		}
 		if i := strings.Index(name, "."); i >= 0 {
 			name = name[i+1:]
@@ -86,8 +91,9 @@ func (c *delegationCache) closestEnclosing(qname string) (zone string, servers [
 }
 
 // put records the servers for zone. ttl is the TTL of the NS records the
-// delegation came in, clamped to a sane range.
-func (c *delegationCache) put(zone string, servers []net.IP, ttl uint32) {
+// delegation came in, clamped to a sane range, and secure says whether the
+// walk that found it was still inside the chain of trust.
+func (c *delegationCache) put(zone string, servers []net.IP, ttl uint32, secure bool) {
 	if c == nil || len(servers) == 0 {
 		return
 	}
@@ -102,6 +108,7 @@ func (c *delegationCache) put(zone string, servers []net.IP, ttl uint32) {
 	}
 	e := &delegationEntry{
 		servers: append([]net.IP(nil), servers...),
+		secure:  secure,
 		expiry:  c.now().Add(time.Duration(ttl) * time.Second),
 	}
 	e.elem = c.order.PushFront(key)

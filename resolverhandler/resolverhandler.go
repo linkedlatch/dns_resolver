@@ -62,6 +62,16 @@ func (h *handler) ServeDNS(ctx context.Context, w dnsserver.ResponseWriter, req 
 	}
 	q := req.Questions[0]
 
+	// CD asks us not to reject data for failing validation. The bit is
+	// echoed so the client can see the request was understood; what it does
+	// not get is the signatures themselves, which this resolver does not
+	// pass on, so "check it yourself" is not on offer - only "show me it
+	// anyway".
+	if req.Header.CD {
+		ctx = resolver.WithoutValidation(ctx)
+		resp.Header.CD = true
+	}
+
 	res, err := h.r.ResolveRR(ctx, q.Name, q.Type)
 	var nxErr *resolver.NXDOMAINError
 	switch {
