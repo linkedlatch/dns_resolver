@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -51,6 +52,18 @@ func main() {
 		QueryTimeout: time.Duration(cfg.QueryTimeout),
 		MaxInFlight:  cfg.MaxInFlight,
 	}
+	if cfg.TLSListen != "" {
+		cert, err := tls.LoadX509KeyPair(cfg.TLSCert, cfg.TLSKey)
+		if err != nil {
+			logger.Error("load TLS certificate", "error", err)
+			os.Exit(1)
+		}
+		srv.TLSAddr = cfg.TLSListen
+		srv.TLSConfig = &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			MinVersion:   tls.VersionTLS12,
+		}
+	}
 
 	// A signal cancels the context, which stops the listeners and lets the
 	// queries already in progress finish before the process exits.
@@ -59,6 +72,7 @@ func main() {
 
 	logger.Info("listening",
 		"addr", cfg.Listen,
+		"tls_addr", cfg.TLSListen,
 		"allow", cfg.Allow,
 		"dnssec", cfg.DNSSEC,
 		"middleware", cfg.Middleware,
@@ -80,8 +94,10 @@ func buildHandler(cfg config.Config, logger *slog.Logger) (dnsserver.Handler, er
 	}
 
 	r := resolver.NewWithOptions(resolver.Options{
-		UpstreamTimeout: time.Duration(cfg.UpstreamTimeout),
-		DisableDNSSEC:   !cfg.DNSSEC,
+		UpstreamTimeout:          time.Duration(cfg.UpstreamTimeout),
+		DisableDNSSEC:            !cfg.DNSSEC,
+		DisableQNAMEMinimization: !cfg.QNAMEMinimization,
+		Use0x20:                  cfg.Use0x20,
 	})
 	handler := resolverhandler.New(r, logger)
 

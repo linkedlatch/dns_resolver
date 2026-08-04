@@ -47,6 +47,21 @@ type Config struct {
 	CacheMinTTL  Duration `json:"cache_min_ttl"`
 	CacheMaxTTL  Duration `json:"cache_max_ttl"`
 
+	// TLSListen, with TLSCert and TLSKey, adds a DNS-over-TLS listener
+	// (RFC 7858), conventionally on port 853.
+	TLSListen string `json:"tls_listen"`
+	TLSCert   string `json:"tls_cert"`
+	TLSKey    string `json:"tls_key"`
+
+	// QNAMEMinimization sends each server only as much of the name as it
+	// needs to answer, rather than the whole thing (RFC 9156).
+	QNAMEMinimization bool `json:"qname_minimization"`
+
+	// Use0x20 randomizes the case of queried names as extra entropy against
+	// forged replies. Off by default: a server that does not echo the case
+	// back exactly breaks resolution outright.
+	Use0x20 bool `json:"use_0x20"`
+
 	// DNSSEC turns signature validation on. With it off, answers are served
 	// unchecked and never marked authentic.
 	DNSSEC bool `json:"dnssec"`
@@ -65,20 +80,21 @@ type Config struct {
 // loopback, validating, with limits sized for a personal resolver.
 func Default() Config {
 	return Config{
-		Listen:          "127.0.0.1:5353",
-		Allow:           []string{"127.0.0.0/8", "::1/128"},
-		RateLimit:       50,
-		Burst:           100,
-		MaxInFlight:     512,
-		QueryTimeout:    Duration(10 * time.Second),
-		UpstreamTimeout: Duration(3 * time.Second),
-		CacheEntries:    10000,
-		CacheMinTTL:     Duration(5 * time.Second),
-		CacheMaxTTL:     Duration(24 * time.Hour),
-		DNSSEC:          true,
-		Middleware:      []string{"acl", "ratelimit", "cache", "singleflight"},
-		LogLevel:        "info",
-		LogFormat:       "text",
+		Listen:            "127.0.0.1:5353",
+		Allow:             []string{"127.0.0.0/8", "::1/128"},
+		RateLimit:         50,
+		Burst:             100,
+		MaxInFlight:       512,
+		QueryTimeout:      Duration(10 * time.Second),
+		UpstreamTimeout:   Duration(3 * time.Second),
+		CacheEntries:      10000,
+		CacheMinTTL:       Duration(5 * time.Second),
+		CacheMaxTTL:       Duration(24 * time.Hour),
+		DNSSEC:            true,
+		QNAMEMinimization: true,
+		Middleware:        []string{"acl", "ratelimit", "cache", "singleflight"},
+		LogLevel:          "info",
+		LogFormat:         "text",
 	}
 }
 
@@ -106,6 +122,9 @@ func Load(path string) (Config, error) {
 func (c Config) Validate() error {
 	if c.Listen == "" {
 		return fmt.Errorf("listen address is empty")
+	}
+	if c.TLSListen != "" && (c.TLSCert == "" || c.TLSKey == "") {
+		return fmt.Errorf("tls_listen is set but tls_cert and tls_key are not")
 	}
 	if _, err := c.AllowedPrefixes(); err != nil {
 		return err

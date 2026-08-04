@@ -2,6 +2,7 @@ package dnsserver
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -45,6 +46,13 @@ type Server struct {
 	Addr    string
 	Handler Handler
 
+	// TLSAddr, when set with TLSConfig, adds a DNS-over-TLS listener
+	// (RFC 7858). It carries the same length-prefixed messages as plain
+	// TCP; the difference is that a network between the client and here can
+	// no longer read or edit the queries, which on port 53 it can.
+	TLSAddr   string
+	TLSConfig *tls.Config
+
 	// QueryTimeout bounds the time spent on one query; MaxInFlight bounds
 	// how many may run at once. Zero means the built-in default.
 	QueryTimeout time.Duration
@@ -77,13 +85,23 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	}
 	defer tcpLn.Close()
 
-	return s.Serve(ctx, udpConn, tcpLn)
+	listeners := []net.Listener{tcpLn}
+	if s.TLSAddr != "" && s.TLSConfig != nil {
+		tlsLn, err := tls.Listen("tcp", s.TLSAddr, s.TLSConfig)
+		if err != nil {
+			return fmt.Errorf("listen TLS: %w", err)
+		}
+		defer tlsLn.Close()
+		listeners = append(listeners, tlsLn)
+	}
+
+	return s.Serve(ctx, udpConn, listeners...)
 }
 
 // Serve is ListenAndServe on listeners the caller has already opened, for
 // when the address has to be bound before the server starts (a socket
 // passed in by an init system, a test that needs the port up front).
-func (s *Server) Serve(ctx context.Context, udpConn *net.UDPConn, tcpLn net.Listener) error {
+func (s *Server) Serve(ctx context.Context, udpConn *net.UDPConn, tcpLns ...net.Listener) error {
 	s.sem = make(chan struct{}, s.maxInFlight())
 
 	ctx, cancel := context.WithCancel(ctx)
@@ -95,13 +113,17 @@ func (s *Server) Serve(ctx context.Context, udpConn *net.UDPConn, tcpLn net.List
 	go func() {
 		<-ctx.Done()
 		udpConn.Close()
-		tcpLn.Close()
+		for _, ln := range tcpLns {
+			ln.Close()
+		}
 		close(closed)
 	}()
 
-	errCh := make(chan error, 2)
+	errCh := make(chan error, 1+len(tcpLns))
 	go func() { errCh <- s.serveUDP(ctx, udpConn) }()
-	go func() { errCh <- s.serveTCP(ctx, tcpLn) }()
+	for _, ln := range tcpLns {
+		go func(ln net.Listener) { errCh <- s.serveTCP(ctx, ln) }(ln)
+	}
 
 	err := <-errCh
 	cancel()

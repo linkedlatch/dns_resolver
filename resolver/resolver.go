@@ -20,6 +20,7 @@ const (
 	maxReferrals   = 30 // guards against referral loops between misconfigured servers
 	maxCNAMEChain  = 15
 	maxGlueLookups = 6 // caps recursive lookups for NS addresses missing glue
+	queryAttempts  = 2 // passes over the server list before giving up
 	udpReadBufSize = 4096
 
 	defaultUpstreamTimeout = 3 * time.Second
@@ -88,7 +89,12 @@ type Resolver struct {
 	anchors  []dnsmsg.DS
 	clock    func() time.Time
 
-	timeout time.Duration // per exchange with one server; 0: default
+	timeout  time.Duration // per exchange with one server; 0: default
+	minimize bool          // send only as much of the name as each server needs
+	use0x20  bool          // randomize the case of queried names
+
+	primeState
+	rtt *rttTracker
 }
 
 // Options configure a Resolver. The zero value matches New(), so a caller
@@ -100,6 +106,13 @@ type Options struct {
 	UpstreamTimeout time.Duration
 	// DisableDNSSEC serves answers without checking their signatures.
 	DisableDNSSEC bool
+	// DisableQNAMEMinimization sends the whole name to every server on the
+	// way down, which tells each of them more than it needs to know.
+	DisableQNAMEMinimization bool
+	// Use0x20 randomizes the case of queried names for extra entropy
+	// against forged replies. Off by default, as unbound has it: a server
+	// that normalizes the case it echoes back breaks resolution outright.
+	Use0x20 bool
 }
 
 // NewWithOptions returns a Resolver configured by opt.
@@ -107,6 +120,8 @@ func NewWithOptions(opt Options) *Resolver {
 	r := New()
 	r.timeout = opt.UpstreamTimeout
 	r.validate = !opt.DisableDNSSEC
+	r.minimize = !opt.DisableQNAMEMinimization
+	r.use0x20 = opt.Use0x20
 	return r
 }
 
@@ -123,7 +138,9 @@ func New() *Resolver {
 	return &Resolver{
 		delegations: newDelegationCache(0),
 		validate:    true,
+		minimize:    true,
 		keys:        newKeyCache(),
+		rtt:         newRTTTracker(),
 	}
 }
 
@@ -137,10 +154,13 @@ func (r *Resolver) startingPoint(qname string) (zone string, servers []net.IP, c
 }
 
 func (r *Resolver) rootServers() []net.IP {
-	if r.roots == nil {
-		return RootServers
+	if r.roots != nil {
+		return r.roots // a fixed set, for tests
 	}
-	return r.roots
+	if primed, ok := r.primedRoots(); ok {
+		return primed
+	}
+	return RootServers
 }
 
 func (r *Resolver) upstreamPort() string {
@@ -204,11 +224,18 @@ func (r *Resolver) resolve(ctx context.Context, qname string, qtype dnsmsg.RRTyp
 	// zone is what the servers we are currently talking to are authoritative
 	// for. It bounds what their answers are allowed to affect: a referral
 	// has to lead strictly below it, and glue has to be a name inside it.
+	if r.roots == nil {
+		r.primeRootServers(ctx)
+	}
 	zone, servers, fromCache := r.startingPoint(qname)
 	sec, err := r.startingSecurity(ctx, zone, servers)
 	if err != nil {
 		return Result{}, err
 	}
+
+	// minimizeOff records that this server would not play along with a
+	// shortened name, so the walk falls back to sending the whole one.
+	minimizeOff := false
 
 	for referrals := 0; ; referrals++ {
 		if err := ctx.Err(); err != nil {
@@ -218,8 +245,25 @@ func (r *Resolver) resolve(ctx context.Context, qname string, qtype dnsmsg.RRTyp
 			return Result{}, fmt.Errorf("too many referrals resolving %s", qname)
 		}
 
-		resp, server, err := r.queryServers(ctx, servers, qname, qtype)
+		// QNAME minimization: ask the server one label below its own zone
+		// rather than the whole name, until the delegations run out.
+		askName, askType := qname, qtype
+		minimizing := false
+		if r.minimize && !minimizeOff {
+			if m := minimizedQName(qname, zone); !equalName(m, qname) {
+				askName, askType, minimizing = m, dnsmsg.TypeA, true
+			}
+		}
+
+		resp, server, err := r.queryServers(ctx, servers, askName, askType)
 		if err != nil {
+			if minimizing {
+				// A server that will not answer the shorter name may still
+				// answer the real one; a privacy measure must not be the
+				// reason a name fails to resolve.
+				minimizeOff = true
+				continue
+			}
 			if fromCache {
 				sec = insecure
 				// The delegation we started from is no longer answering.
@@ -235,6 +279,14 @@ func (r *Resolver) resolve(ctx context.Context, qname string, qtype dnsmsg.RRTyp
 			return Result{}, err
 		}
 
+		if resp.Header.RCode != dnsmsg.RCodeSuccess && minimizing {
+			// An intermediate name may legitimately not exist as a name of
+			// its own (an empty non-terminal), and some servers answer
+			// NXDOMAIN for it anyway. Neither says anything about the name
+			// actually being resolved, so ask for that instead.
+			minimizeOff = true
+			continue
+		}
 		if resp.Header.RCode == dnsmsg.RCodeNameError {
 			return Result{}, newNXDOMAINError(qname, resp.Authorities)
 		}
@@ -254,7 +306,7 @@ func (r *Resolver) resolve(ctx context.Context, qname string, qtype dnsmsg.RRTyp
 		// different question and is thrown away.
 		name := qname
 		var chain, answers []dnsmsg.RR
-		for {
+		for !minimizing {
 			var cname *dnsmsg.RR
 			for i, rr := range resp.Answers {
 				if !equalName(rr.Name, name) || rr.Class != dnsmsg.ClassIN {
@@ -283,7 +335,7 @@ func (r *Resolver) resolve(ctx context.Context, qname string, qtype dnsmsg.RRTyp
 			name = cname.CNAME
 		}
 
-		if len(answers) > 0 {
+		if len(answers) > 0 && !minimizing {
 			all := append(chain, answers...)
 			secure, err := r.validateAnswer(sec, resp, all)
 			if err != nil {
@@ -291,7 +343,7 @@ func (r *Resolver) resolve(ctx context.Context, qname string, qtype dnsmsg.RRTyp
 			}
 			return Result{Answers: all, Secure: secure}, nil
 		}
-		if name != qname {
+		if name != qname && !minimizing {
 			// The chain left what this server knows about; resolve the
 			// rest from the root, keeping the CNAMEs collected so far in
 			// front of whatever it finds.
@@ -340,6 +392,12 @@ func (r *Resolver) resolve(ctx context.Context, qname string, qtype dnsmsg.RRTyp
 			if nsTTL == 0 || rr.TTL < nsTTL {
 				nsTTL = rr.TTL
 			}
+		}
+		if len(nsNames) == 0 && minimizing {
+			// The delegations have run out: this server is the one that
+			// holds the name, so ask it the real question.
+			minimizeOff = true
+			continue
 		}
 		if len(nsNames) == 0 {
 			// NODATA (RFC 2308 2.2): NOERROR with neither an answer nor a
@@ -414,6 +472,7 @@ func (r *Resolver) resolve(ctx context.Context, qname string, qtype dnsmsg.RRTyp
 		servers = newServers
 		zone = newZone
 		fromCache = false
+		minimizeOff = false // a new server, which may well cooperate
 	}
 }
 
@@ -442,22 +501,42 @@ func (r *Resolver) allowsUpstream(ip net.IP) bool {
 	return true
 }
 
-// queryServers tries each server in turn until one answers.
+// queryServers tries the servers in turn until one answers, preferring the
+// ones that have been answering quickly.
+//
+// Each server gets more than one chance: a single lost UDP datagram is
+// ordinary, and giving up on a server for it means abandoning the only
+// machine that may hold the answer. Retries stay within the query's own
+// deadline, so this cannot extend how long a client waits.
 func (r *Resolver) queryServers(ctx context.Context, servers []net.IP, qname string, qtype dnsmsg.RRType) (*dnsmsg.Message, net.IP, error) {
 	var lastErr error
-	for _, s := range servers {
-		// Checked again here, not only where addresses are taken from a
-		// response, so that no path reaches a dial without passing it.
-		if !r.allowsUpstream(s) {
-			lastErr = fmt.Errorf("refusing to query name server at %s", s)
-			continue
+	ordered := r.rtt.order(servers)
+
+	for attempt := 0; attempt < queryAttempts; attempt++ {
+		for _, s := range ordered {
+			if err := ctx.Err(); err != nil {
+				return nil, nil, err
+			}
+			// Checked again here, not only where addresses are taken from a
+			// response, so that no path reaches a dial without passing it.
+			if !r.allowsUpstream(s) {
+				lastErr = fmt.Errorf("refusing to query name server at %s", s)
+				continue
+			}
+
+			started := time.Now()
+			msg, err := r.query(ctx, s, qname, qtype)
+			if err != nil {
+				r.rtt.observe(s, timeoutPenalty)
+				lastErr = err
+				continue
+			}
+			r.rtt.observe(s, time.Since(started))
+			return msg, s, nil
 		}
-		msg, err := r.query(ctx, s, qname, qtype)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		return msg, s, nil
+	}
+	if lastErr == nil {
+		lastErr = errors.New("no usable name server address")
 	}
 	return nil, nil, fmt.Errorf("all %d server(s) failed, last error: %w", len(servers), lastErr)
 }
@@ -487,27 +566,35 @@ func (r *Resolver) queryOnce(ctx context.Context, server net.IP, qname string, q
 	if err != nil {
 		return nil, fmt.Errorf("generate query ID: %w", err)
 	}
+	// The name on the wire may differ in case from the one we are looking
+	// for; the server has to echo it back exactly, which is what makes the
+	// extra entropy worth anything.
+	wireName := qname
+	if r.use0x20 {
+		wireName = randomizeCase(qname)
+	}
+
 	var packet []byte
 	if edns == withEDNS0 {
 		do := dnsmsg.NoDNSSEC
 		if r.validate {
 			do = dnsmsg.RequestDNSSEC
 		}
-		packet, err = dnsmsg.PackQueryEDNS0(id, qname, qtype, dnsmsg.DefaultUDPSize, do)
+		packet, err = dnsmsg.PackQueryEDNS0(id, wireName, qtype, dnsmsg.DefaultUDPSize, do)
 	} else {
-		packet, err = dnsmsg.PackQuery(id, qname, qtype)
+		packet, err = dnsmsg.PackQuery(id, wireName, qtype)
 	}
 	if err != nil {
 		return nil, err
 	}
 
 	addr := net.JoinHostPort(server.String(), r.upstreamPort())
-	msg, err := queryUDP(ctx, r.upstreamTimeout(), addr, packet, id, qname, qtype)
+	msg, err := queryUDP(ctx, r.upstreamTimeout(), addr, packet, id, wireName, qtype, r.use0x20)
 	if err != nil {
 		return nil, err
 	}
 	if msg.Header.TC {
-		msg, err = queryTCP(ctx, r.upstreamTimeout(), addr, packet, id, qname, qtype)
+		msg, err = queryTCP(ctx, r.upstreamTimeout(), addr, packet, id, wireName, qtype, r.use0x20)
 		if err != nil {
 			return nil, err
 		}
@@ -556,7 +643,7 @@ func socketDeadline(ctx context.Context, timeout time.Duration) time.Time {
 	return deadline
 }
 
-func queryUDP(ctx context.Context, timeout time.Duration, addr string, packet []byte, id uint16, qname string, qtype dnsmsg.RRType) (*dnsmsg.Message, error) {
+func queryUDP(ctx context.Context, timeout time.Duration, addr string, packet []byte, id uint16, qname string, qtype dnsmsg.RRType, strictCase bool) (*dnsmsg.Message, error) {
 	conn, err := dial(ctx, "udp", addr, timeout)
 	if err != nil {
 		return nil, err
@@ -572,10 +659,10 @@ func queryUDP(ctx context.Context, timeout time.Duration, addr string, packet []
 	if err != nil {
 		return nil, err
 	}
-	return unpackAndVerify(buf[:n], id, qname, qtype)
+	return unpackAndVerify(buf[:n], id, qname, qtype, strictCase)
 }
 
-func queryTCP(ctx context.Context, timeout time.Duration, addr string, packet []byte, id uint16, qname string, qtype dnsmsg.RRType) (*dnsmsg.Message, error) {
+func queryTCP(ctx context.Context, timeout time.Duration, addr string, packet []byte, id uint16, qname string, qtype dnsmsg.RRType, strictCase bool) (*dnsmsg.Message, error) {
 	conn, err := dial(ctx, "tcp", addr, timeout)
 	if err != nil {
 		return nil, err
@@ -598,7 +685,7 @@ func queryTCP(ctx context.Context, timeout time.Duration, addr string, packet []
 	if _, err := readFull(conn, buf); err != nil {
 		return nil, err
 	}
-	return unpackAndVerify(buf, id, qname, qtype)
+	return unpackAndVerify(buf, id, qname, qtype, strictCase)
 }
 
 func readFull(conn net.Conn, buf []byte) (int, error) {
@@ -618,7 +705,7 @@ func readFull(conn net.Conn, buf []byte) (int, error) {
 // by an off-path attacker racing the real server's reply. QR and the
 // echoed question are cheap additional checks against spoofed or
 // misdirected responses.
-func unpackAndVerify(buf []byte, wantID uint16, qname string, qtype dnsmsg.RRType) (*dnsmsg.Message, error) {
+func unpackAndVerify(buf []byte, wantID uint16, qname string, qtype dnsmsg.RRType, strictCase bool) (*dnsmsg.Message, error) {
 	msg, err := dnsmsg.Unpack(buf)
 	if err != nil {
 		return nil, err
@@ -631,6 +718,12 @@ func unpackAndVerify(buf []byte, wantID uint16, qname string, qtype dnsmsg.RRTyp
 	}
 	if len(msg.Questions) != 1 || !equalName(msg.Questions[0].Name, qname) || msg.Questions[0].Type != qtype {
 		return nil, fmt.Errorf("response question section does not match query for %s %s", qname, qtype)
+	}
+	// With 0x20 encoding the case we sent is part of the secret: a server
+	// echoes the question verbatim, so a reply that differs in case did not
+	// come from one that saw our query.
+	if strictCase && msg.Questions[0].Name != qname {
+		return nil, fmt.Errorf("response question %q does not match the name we sent %q", msg.Questions[0].Name, qname)
 	}
 	// We only ever ask in class IN, so an answer in any other class is not
 	// a reply to what we sent, whatever its name and type say.
