@@ -466,28 +466,27 @@ func (r *Resolver) checkDenial(sec secState, section []dnsmsg.RR, prove func([]d
 // verifiedNSECs returns the denial records of a section that carry a valid
 // signature, dropping the rest.
 //
-// Unsigned NSEC records are worth nothing: the point of a gap is that the
-// zone committed to it in advance, and anyone can write one down. NSEC3
-// records are passed through unverified because nothing here reads them
-// either way - their presence only tells the proof which form it is looking
-// at, and the caller treats that as "not checked".
+// An unsigned denial record is worth nothing: the point of a gap is that
+// the zone committed to it in advance, and anyone can write one down.
 func (r *Resolver) verifiedNSECs(section []dnsmsg.RR, keys []*dnsmsg.DNSKEY) []dnsmsg.RR {
+	type ownerType struct {
+		name  string
+		qtype dnsmsg.RRType
+	}
 	var out []dnsmsg.RR
-	checked := make(map[string]bool)
+	checked := make(map[ownerType]bool)
 	for _, rr := range section {
-		switch rr.Type {
-		case dnsmsg.TypeNSEC3:
-			out = append(out, rr)
-		case dnsmsg.TypeNSEC:
-			owner := normalizeName(rr.Name)
-			if checked[owner] {
-				continue
-			}
-			checked[owner] = true
-			rrset := recordsOfType(section, dnsmsg.TypeNSEC, rr.Name)
-			if _, err := r.verifyRRSet(rrset, section, keys); err == nil {
-				out = append(out, rrset...)
-			}
+		if rr.Type != dnsmsg.TypeNSEC && rr.Type != dnsmsg.TypeNSEC3 {
+			continue
+		}
+		k := ownerType{name: normalizeName(rr.Name), qtype: rr.Type}
+		if checked[k] {
+			continue
+		}
+		checked[k] = true
+		rrset := recordsOfType(section, rr.Type, rr.Name)
+		if _, err := r.verifyRRSet(rrset, section, keys); err == nil {
+			out = append(out, rrset...)
 		}
 	}
 	return out

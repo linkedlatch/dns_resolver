@@ -60,6 +60,27 @@ type NSEC struct {
 	TypeBitmap []byte
 }
 
+// NSEC3 does the same as NSEC over hashes of the names rather than the
+// names themselves, so that walking the chain does not hand out a list of
+// everything in the zone.
+type NSEC3 struct {
+	Algorithm  uint8
+	Flags      uint8
+	Iterations uint16
+	Salt       []byte
+	NextHashed []byte // the next owner hash, unencoded
+	TypeBitmap []byte
+}
+
+// NSEC3FlagOptOut marks a record whose gap may contain unsigned delegations
+// it says nothing about (RFC 5155 6). It is what lets a zone the size of
+// com sign without an NSEC3 record for every name in it.
+const NSEC3FlagOptOut = 1
+
+// OptOut reports whether this record's gap is allowed to hide unsigned
+// delegations.
+func (n *NSEC3) OptOut() bool { return n.Flags&NSEC3FlagOptOut != 0 }
+
 // parseDNSKEY reads DNSKEY RDATA out of a record's raw bytes.
 func parseDNSKEY(raw []byte) (*DNSKEY, error) {
 	if len(raw) < 4 {
@@ -117,6 +138,31 @@ func parseNSEC(raw []byte) (*NSEC, error) {
 		return nil, fmt.Errorf("NSEC next domain: %w", err)
 	}
 	return &NSEC{NextDomain: name, TypeBitmap: raw[n:]}, nil
+}
+
+func parseNSEC3(raw []byte) (*NSEC3, error) {
+	if len(raw) < 5 {
+		return nil, fmt.Errorf("NSEC3 RDATA is %d bytes, want at least 5", len(raw))
+	}
+	n := &NSEC3{
+		Algorithm:  raw[0],
+		Flags:      raw[1],
+		Iterations: binary.BigEndian.Uint16(raw[2:4]),
+	}
+	saltLen := int(raw[4])
+	if len(raw) < 5+saltLen+1 {
+		return nil, fmt.Errorf("NSEC3 RDATA ends inside its salt")
+	}
+	n.Salt = raw[5 : 5+saltLen]
+
+	rest := raw[5+saltLen:]
+	hashLen := int(rest[0])
+	if len(rest) < 1+hashLen {
+		return nil, fmt.Errorf("NSEC3 RDATA ends inside its next hashed owner name")
+	}
+	n.NextHashed = rest[1 : 1+hashLen]
+	n.TypeBitmap = rest[1+hashLen:]
+	return n, nil
 }
 
 // readUncompressedName decodes a domain name that cannot contain
@@ -217,11 +263,24 @@ func (k *DNSKEY) rdata() []byte {
 // to being present for some other purpose.
 func (k *DNSKEY) IsZoneKey() bool { return k.Flags&DNSKEYFlagZoneKey != 0 }
 
-// TypeInBitmap reports whether the NSEC type bitmap (RFC 4034 4.1.2) lists
-// the given type, which is how an NSEC record says what does and does not
+// AsNSEC3 returns the parsed NSEC3 in rr, or false if it is not one.
+func (rr RR) AsNSEC3() (*NSEC3, bool) {
+	if rr.Type != TypeNSEC3 {
+		return nil, false
+	}
+	nsec3, err := parseNSEC3(rr.Raw)
+	return nsec3, err == nil
+}
+
+// TypeInBitmap reports whether the type bitmap (RFC 4034 4.1.2) lists the
+// given type, which is how a denial record says what does and does not
 // exist at a name.
-func (n *NSEC) TypeInBitmap(t RRType) bool {
-	buf := n.TypeBitmap
+func (n *NSEC) TypeInBitmap(t RRType) bool { return typeInBitmap(n.TypeBitmap, t) }
+
+// TypeInBitmap reports the same for a hashed name.
+func (n *NSEC3) TypeInBitmap(t RRType) bool { return typeInBitmap(n.TypeBitmap, t) }
+
+func typeInBitmap(buf []byte, t RRType) bool {
 	for len(buf) >= 2 {
 		window, length := buf[0], int(buf[1])
 		if len(buf) < 2+length {

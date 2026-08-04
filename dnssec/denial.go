@@ -34,10 +34,42 @@ import (
 var ErrNoDenial = errors.New("denial of existence not proven")
 
 // ErrUnsupportedDenial means the proof is there but in a form this package
-// does not check - NSEC3, whose hashed names need their own machinery.
-// Like an unsupported algorithm it is not evidence of tampering, so the
-// caller treats the data as unvalidated rather than forged.
-var ErrUnsupportedDenial = errors.New("denial proven with NSEC3, which is not checked here")
+// cannot read: an NSEC3 hash algorithm it does not implement, or an
+// iteration count too high to be worth computing. Like an unsupported
+// signature algorithm it is not evidence of tampering, so the caller treats
+// the data as unvalidated rather than forged.
+var ErrUnsupportedDenial = errors.New("denial proven in a form that cannot be checked here")
+
+// denial is a section's denial records, sorted into the two forms. A proof
+// is read entirely in one or the other: a zone signs with NSEC or with
+// NSEC3, never with both.
+type denial struct {
+	nsec  []nsecRecord
+	nsec3 []nsec3Record
+	zone  string // for NSEC3, the zone the hashed owner names sit in
+}
+
+func collectDenial(records []dnsmsg.RR) (denial, error) {
+	var d denial
+	for _, rr := range records {
+		if nsec, ok := rr.AsNSEC(); ok {
+			d.nsec = append(d.nsec, nsecRecord{owner: rr.Name, rr: nsec})
+		}
+	}
+	if len(d.nsec) > 0 {
+		return d, nil
+	}
+
+	nsec3s, zone, err := nsec3Records(records)
+	if err != nil {
+		return denial{}, err
+	}
+	if len(nsec3s) == 0 {
+		return denial{}, fmt.Errorf("%w: the response carried no NSEC or NSEC3 records", ErrNoDenial)
+	}
+	d.nsec3, d.zone = nsec3s, zone
+	return d, nil
+}
 
 // ProveNoDS reports whether the records prove that zone has no DS record,
 // which is what makes a delegation an unsigned one.
@@ -49,10 +81,14 @@ var ErrUnsupportedDenial = errors.New("denial proven with NSEC3, which is not ch
 // name may not exist as an NSEC owner at all, in which case a record whose
 // gap covers it says the same thing more strongly.
 func ProveNoDS(records []dnsmsg.RR, zone string) error {
-	nsecs, err := usableNSECs(records)
+	d, err := collectDenial(records)
 	if err != nil {
 		return err
 	}
+	if len(d.nsec3) > 0 {
+		return proveNoDSNSEC3(d.nsec3, zone)
+	}
+	nsecs := d.nsec
 
 	for _, n := range nsecs {
 		if !equalName(n.owner, zone) {
@@ -83,10 +119,14 @@ func ProveNoDS(records []dnsmsg.RR, zone string) error {
 // The second proof closes that: the wildcard at the closest existing
 // ancestor is missing too (RFC 4035 5.4).
 func ProveNameError(records []dnsmsg.RR, qname string) error {
-	nsecs, err := usableNSECs(records)
+	d, err := collectDenial(records)
 	if err != nil {
 		return err
 	}
+	if len(d.nsec3) > 0 {
+		return proveNameErrorNSEC3(d.nsec3, qname, d.zone)
+	}
+	nsecs := d.nsec
 
 	covering := findCovering(nsecs, qname)
 	if covering == nil {
@@ -102,10 +142,14 @@ func ProveNameError(records []dnsmsg.RR, qname string) error {
 // ProveNoData reports whether the records prove that qname exists but has
 // no record of qtype - the NODATA answer of RFC 2308.
 func ProveNoData(records []dnsmsg.RR, qname string, qtype dnsmsg.RRType) error {
-	nsecs, err := usableNSECs(records)
+	d, err := collectDenial(records)
 	if err != nil {
 		return err
 	}
+	if len(d.nsec3) > 0 {
+		return proveNoDataNSEC3(d.nsec3, qname, qtype, d.zone)
+	}
+	nsecs := d.nsec
 
 	for _, n := range nsecs {
 		if !equalName(n.owner, qname) {
@@ -157,11 +201,14 @@ func ProveNoData(records []dnsmsg.RR, qname string, qtype dnsmsg.RRType) error {
 // replay it as the answer for any name under example.com, including names
 // that have real records of their own.
 func ProveNoCloserMatch(records []dnsmsg.RR, qname string) error {
-	nsecs, err := usableNSECs(records)
+	d, err := collectDenial(records)
 	if err != nil {
 		return err
 	}
-	if findCovering(nsecs, qname) == nil {
+	if len(d.nsec3) > 0 {
+		return proveNoCloserMatchNSEC3(d.nsec3, qname, d.zone)
+	}
+	if findCovering(d.nsec, qname) == nil {
 		return fmt.Errorf("%w: a wildcard answered for %s without proving the name itself is missing", ErrNoDenial, qname)
 	}
 	return nil
@@ -207,30 +254,6 @@ func (n nsecRecord) closestEncloser(name string) string {
 		return a
 	}
 	return b
-}
-
-// usableNSECs collects the NSEC records to reason over. It is also where
-// the NSEC3-only case is recognised: records that are present and may well
-// prove the point, in a form checked elsewhere.
-func usableNSECs(records []dnsmsg.RR) ([]nsecRecord, error) {
-	var out []nsecRecord
-	nsec3 := false
-	for _, rr := range records {
-		if rr.Type == dnsmsg.TypeNSEC3 {
-			nsec3 = true
-			continue
-		}
-		if nsec, ok := rr.AsNSEC(); ok {
-			out = append(out, nsecRecord{owner: rr.Name, rr: nsec})
-		}
-	}
-	if len(out) == 0 {
-		if nsec3 {
-			return nil, ErrUnsupportedDenial
-		}
-		return nil, fmt.Errorf("%w: the response carried no NSEC records", ErrNoDenial)
-	}
-	return out, nil
 }
 
 func findCovering(nsecs []nsecRecord, name string) *nsecRecord {
