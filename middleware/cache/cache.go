@@ -51,8 +51,13 @@ type entry struct {
 	rcode       dnsmsg.RCode
 	answers     []dnsmsg.RR
 	authorities []dnsmsg.RR
-	expiry      time.Time
-	elem        *list.Element
+	// authentic records that the signatures on this answer were checked and
+	// held. It has to be stored with the answer: the client cannot tell, and
+	// a cache that dropped it would report every validated answer as
+	// unvalidated from the second query onwards.
+	authentic bool
+	expiry    time.Time
+	elem      *list.Element
 }
 
 // Config sizes the cache and bounds how long entries live, whatever TTL
@@ -104,7 +109,7 @@ func newStore(cfg Config) *store {
 // lookup returns a cached response for (name, qtype) with each RR's TTL
 // reduced by the time elapsed since it was stored. ok is false on a miss or
 // if the entry has fully expired (in which case it's evicted here).
-func (s *store) lookup(name string, qtype dnsmsg.RRType) (rcode dnsmsg.RCode, answers, authorities []dnsmsg.RR, ok bool) {
+func (s *store) lookup(name string, qtype dnsmsg.RRType) (rcode dnsmsg.RCode, answers, authorities []dnsmsg.RR, authentic, ok bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -119,14 +124,14 @@ func (s *store) lookup(name string, qtype dnsmsg.RRType) (rcode dnsmsg.RCode, an
 		e, found = s.enclosingNXDOMAIN(name)
 	}
 	if !found {
-		return 0, nil, nil, false
+		return 0, nil, nil, false, false
 	}
 	k := e.key
 	remaining := e.expiry.Sub(s.now())
 	if remaining <= 0 {
 		s.order.Remove(e.elem)
 		delete(s.entries, k)
-		return 0, nil, nil, false
+		return 0, nil, nil, false, false
 	}
 	s.order.MoveToFront(e.elem)
 
@@ -134,14 +139,14 @@ func (s *store) lookup(name string, qtype dnsmsg.RRType) (rcode dnsmsg.RCode, an
 	if ttl == 0 {
 		ttl = 1 // round up: still valid, don't advertise a zero/expired TTL
 	}
-	return e.rcode, withTTL(e.answers, ttl), withTTL(e.authorities, ttl), true
+	return e.rcode, withTTL(e.answers, ttl), withTTL(e.authorities, ttl), e.authentic, true
 }
 
 // put caches a response. Positive responses use the smallest TTL among
 // their answer RRs; NXDOMAIN responses use the negative TTL derived from
 // the SOA record in authorities (RFC 2308), or a small fallback if there
 // wasn't one. Anything else (SERVFAIL, NODATA, ...) is not cached.
-func (s *store) put(name string, qtype dnsmsg.RRType, rcode dnsmsg.RCode, answers, authorities []dnsmsg.RR) {
+func (s *store) put(name string, qtype dnsmsg.RRType, rcode dnsmsg.RCode, answers, authorities []dnsmsg.RR, authentic bool) {
 	var ttl uint32
 	switch {
 	case rcode == dnsmsg.RCodeNameError:
@@ -185,6 +190,7 @@ func (s *store) put(name string, qtype dnsmsg.RRType, rcode dnsmsg.RCode, answer
 		// holds these records and is free to modify them.
 		answers:     dnsmsg.CloneRRs(answers),
 		authorities: dnsmsg.CloneRRs(authorities),
+		authentic:   authentic,
 		expiry:      s.now().Add(time.Duration(ttl) * time.Second),
 	}
 	e.elem = s.order.PushFront(k)
@@ -275,13 +281,14 @@ func (h *handler) ServeDNS(ctx context.Context, w dnsserver.ResponseWriter, req 
 	}
 	q := req.Questions[0]
 
-	if rcode, answers, authorities, ok := h.store.lookup(q.Name, q.Type); ok {
+	if rcode, answers, authorities, authentic, ok := h.store.lookup(q.Name, q.Type); ok {
 		w.WriteMsg(&dnsmsg.Message{
 			Header: dnsmsg.Header{
 				ID:    req.Header.ID,
 				QR:    true,
 				RD:    req.Header.RD,
 				RA:    true,
+				AD:    authentic,
 				RCode: rcode,
 			},
 			Questions:   req.Questions,
@@ -294,7 +301,7 @@ func (h *handler) ServeDNS(ctx context.Context, w dnsserver.ResponseWriter, req 
 	rec := &recordingWriter{ResponseWriter: w, maxTTL: h.store.maxTTL}
 	h.next.ServeDNS(ctx, rec, req)
 	if rec.msg != nil {
-		h.store.put(q.Name, q.Type, rec.msg.Header.RCode, rec.msg.Answers, rec.msg.Authorities)
+		h.store.put(q.Name, q.Type, rec.msg.Header.RCode, rec.msg.Answers, rec.msg.Authorities, rec.msg.Header.AD)
 	}
 }
 

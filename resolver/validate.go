@@ -96,22 +96,66 @@ func (r *Resolver) crossDelegation(ctx context.Context, parent secState, resp *d
 	if !parent.secure {
 		return insecure, nil // already below an unsigned delegation
 	}
+	return r.enterZone(ctx, parent, resp.Authorities, zone, servers)
+}
 
-	dsSet := recordsOfType(resp.Authorities, dnsmsg.TypeDS, zone)
+// descendTo carries validation from the zone the walk thinks it is in down
+// to the zone that actually answered, one cut at a time.
+//
+// It exists because a name server authoritative for both a zone and its
+// parent answers from the child directly, with no referral to say the walk
+// crossed a boundary: ask the servers for cz about nic.cz and they answer
+// as nic.cz, signed with nic.cz's key. Validating that against cz's keys
+// fails, and the name becomes unresolvable - which is how registries that
+// run their own domains on their registry servers used to break here.
+func (r *Resolver) descendTo(ctx context.Context, sec secState, from, to string, servers []net.IP) (secState, error) {
+	for zone := from; !equalName(zone, to); {
+		child := minimizedQName(to, zone)
+		next, err := r.fetchDelegation(ctx, sec, child, servers)
+		if err != nil {
+			return insecure, err
+		}
+		if !next.secure {
+			return insecure, nil // an unsigned cut on the way down ends it
+		}
+		sec, zone = next, child
+	}
+	return sec, nil
+}
+
+// fetchDelegation crosses into zone when no referral handed us its DS
+// records, by asking for them. The DS belongs to the parent, so the servers
+// answering for the parent are the ones to ask.
+func (r *Resolver) fetchDelegation(ctx context.Context, parent secState, zone string, servers []net.IP) (secState, error) {
+	resp, _, err := r.queryServers(ctx, servers, zone, dnsmsg.TypeDS)
+	if err != nil {
+		return insecure, fmt.Errorf("fetch DS for %s: %w", zone, err)
+	}
+	// A DS that exists comes back as an answer; the proof that none exists
+	// comes back in the authority section. Either can settle the question.
+	section := append(append([]dnsmsg.RR{}, resp.Answers...), resp.Authorities...)
+	return r.enterZone(ctx, parent, section, zone, servers)
+}
+
+// enterZone decides what the security state below a zone cut is, given the
+// section that the DS records - or the proof that there are none - arrived
+// in.
+func (r *Resolver) enterZone(ctx context.Context, parent secState, section []dnsmsg.RR, zone string, servers []net.IP) (secState, error) {
+	dsSet := recordsOfType(section, dnsmsg.TypeDS, zone)
 	if len(dsSet) == 0 {
 		// No DS: the child is unsigned, and everything under it is
 		// unvalidated from here on. The parent has to prove that, though -
 		// otherwise stripping the DS records out of a referral downgrades
 		// any signed zone to an unsigned one, and the chain of trust can be
 		// cut at every link.
-		if _, err := r.checkDenial(parent, resp.Authorities, func(nsecs []dnsmsg.RR) error {
+		if _, err := r.checkDenial(parent, section, func(nsecs []dnsmsg.RR) error {
 			return dnssec.ProveNoDS(nsecs, zone)
 		}); err != nil {
 			return insecure, fmt.Errorf("%w: unsigned delegation of %s: %v", ErrBogus, zone, err)
 		}
 		return insecure, nil
 	}
-	if _, err := r.verifyRRSet(dsSet, resp.Authorities, parent.keys); err != nil {
+	if _, err := r.verifyRRSet(dsSet, section, parent.keys); err != nil {
 		return insecure, fmt.Errorf("%w: DS for %s: %v", ErrBogus, zone, err)
 	}
 
@@ -235,6 +279,35 @@ func (r *Resolver) verifyRRSetWithKeys(rrset []dnsmsg.RR, section []dnsmsg.RR, k
 		return nil, dnssec.ErrUnsupportedAlgorithm
 	}
 	return nil, lastErr
+}
+
+// signerBelow reports which zone under the current one a response's
+// signatures were made by, or "" if they came from the zone we are in.
+//
+// The name is taken from the response, which an attacker could of course
+// write anything into. It is safe to act on because acting on it means
+// walking the DS chain to that zone and checking every step: a made-up
+// signer leads to a chain that does not build, and a real one leads to the
+// zone that genuinely holds the name. A signer that is not an ancestor of
+// the name being resolved is discarded outright, since no zone signs for
+// names outside itself.
+func signerBelow(resp *dnsmsg.Message, zone, qname string) string {
+	deepest := ""
+	for _, section := range [][]dnsmsg.RR{resp.Answers, resp.Authorities} {
+		for _, rr := range section {
+			sig, ok := rr.AsRRSIG()
+			if !ok {
+				continue
+			}
+			if !isProperSubdomain(sig.SignerName, zone) || !isSubdomainOrEqual(qname, sig.SignerName) {
+				continue
+			}
+			if deepest == "" || isProperSubdomain(sig.SignerName, deepest) {
+				deepest = sig.SignerName
+			}
+		}
+	}
+	return deepest
 }
 
 // rrsigsFor picks the signatures in a section that claim to cover a

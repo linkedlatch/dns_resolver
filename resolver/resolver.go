@@ -288,6 +288,20 @@ func (r *Resolver) resolve(ctx context.Context, qname string, qtype dnsmsg.RRTyp
 			minimizeOff = true
 			continue
 		}
+		// A server authoritative for a zone and its parent both answers from
+		// the child without a referral, so the walk can be standing in the
+		// parent while the reply comes from the child. The signatures say
+		// which zone actually answered; validation has to follow them down
+		// before anything in the response can be checked at all.
+		if !minimizing && sec.secure {
+			if signer := signerBelow(resp, zone, qname); signer != "" {
+				if sec, err = r.descendTo(ctx, sec, zone, signer, servers); err != nil {
+					return Result{}, err
+				}
+				zone = signer
+			}
+		}
+
 		if resp.Header.RCode == dnsmsg.RCodeNameError {
 			// A signed zone has to prove a name is missing, not just say so.
 			// Without the proof, anyone who can reach the client can erase
